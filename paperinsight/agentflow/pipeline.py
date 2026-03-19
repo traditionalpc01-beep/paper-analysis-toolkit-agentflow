@@ -499,14 +499,14 @@ class AgentPreparePipeline:
             )
 
             row = final_paper_data.to_excel_row()
-            row["File"] = source_pdf.name if source_pdf else paper_entry.get("paper_key", "")
-            row["URL"] = source_pdf.resolve().as_uri() if source_pdf and source_pdf.exists() else ""
+            row["file"] = source_pdf.name if source_pdf else paper_entry.get("paper_key", "")
+            row["url"] = source_pdf.resolve().as_uri() if source_pdf and source_pdf.exists() else ""
             row["processing_status"] = self._build_finalize_processing_status(paper_entry, final_paper_data)
             dict_results.append(row)
 
             dumped = final_paper_data.model_dump()
-            dumped["File"] = row["File"]
-            dumped["URL"] = row["URL"]
+            dumped["file"] = row["file"]
+            dumped["url"] = row["url"]
             dumped["processing_status"] = row["processing_status"]
             json_results.append(dumped)
 
@@ -739,27 +739,27 @@ class AgentPreparePipeline:
         source_pdf: Optional[Path],
     ) -> dict[str, Any]:
         return {
-            "File": source_pdf.name if source_pdf else paper_entry.get("paper_key", ""),
-            "URL": source_pdf.resolve().as_uri() if source_pdf and source_pdf.exists() else "",
-            "处理结果/简述": f"incomplete: {paper_entry.get('status', 'missing_data')}",
-            "标题": paper_entry.get("title") or paper_entry.get("title_hint") or "",
-            "期刊": paper_entry.get("journal_name") or "",
-            "影响因子": paper_entry.get("impact_factor") or "",
-            "影响因子年份": paper_entry.get("impact_factor_year") or "",
-            "影响因子来源": paper_entry.get("impact_factor_source") or "",
-            "影响因子状态": paper_entry.get("impact_factor_status") or "",
-            "作者": "",
-            "器件结构": "",
-            "EQE": "",
-            "CIE": "",
-            "寿命": "",
-            "最高EQE": "",
-            "优化层级": "",
-            "优化策略": "",
-            "优化详情": "",
-            "关键发现": "",
-            "EQE原文": "",
-            "CIE原文": "",
-            "寿命原文": "",
-            "结构原文": "",
+            "file": source_pdf.name if source_pdf else paper_entry.get("paper_key", ""),
+            "url": source_pdf.resolve().as_uri() if source_pdf and source_pdf.exists() else "",
+            "processing_status": f"incomplete: {paper_entry.get('status', 'missing_data')}",
+            "title": paper_entry.get("title") or paper_entry.get("title_hint") or "",
+            "journal": paper_entry.get("journal_name") or "",
+            "impact_factor": paper_entry.get("impact_factor") or "",
+            "impact_factor_year": paper_entry.get("impact_factor_year") or "",
+            "impact_factor_source": paper_entry.get("impact_factor_source") or "",
+            "impact_factor_status": paper_entry.get("impact_factor_status") or "",
+            "authors": "",
+            "structure": "",
+            "eqe": "",
+            "cie": "",
+            "lifetime": "",
+            "best_eqe": "",
+            "optimization_level": "",
+            "optimization_strategy": "",
+            "optimization_details": "",
+            "key_findings": "",
+            "eqe_source": "",
+            "cie_source": "",
+            "lifetime_source": "",
+            "structure_source": "",
         }

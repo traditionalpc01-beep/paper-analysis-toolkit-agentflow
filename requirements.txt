@@ -1,49 +1,8 @@
-# PaperInsight CLI - 依赖包
-# 安装命令: pip install -r requirements.txt
-
-# ============================================================
-# 核心依赖
-# ============================================================
-
-# CLI 框架
-typer>=0.9.0
-rich>=13.0.0
-
-# PDF 处理
-PyMuPDF>=1.23.0
-pdfplumber>=0.7.0
-
-# 数据处理
-pandas>=2.0.0
+openai>=1.0.0
 openpyxl>=3.1.0
 pydantic>=2.0.0
-
-# 配置管理
-pyyaml>=6.0
-
-# 网络请求
+PyMuPDF>=1.23.0
+PyYAML>=6.0
 requests>=2.31.0
-
-# HTML 解析（实验性 AI 影响因子获取模块）
-beautifulsoup4>=4.12.0
-
-# 进度展示
-tqdm>=4.66.0
-
-# 环境变量
-python-dotenv>=1.0.0
-
-# ============================================================
-# 可选依赖 - OCR
-# ============================================================
-# 安装: pip install -r requirements.txt -r requirements-ocr.txt
-
-# paddlepaddle>=3.0.0
-# paddleocr>=3.0.0
-
-# ============================================================
-# 可选依赖 - LLM
-# ============================================================
-# 安装: pip install -r requirements.txt -r requirements-llm.txt
-
-# openai>=1.0.0
+rich>=13.0.0
+typer>=0.9.0

@@ -7,24 +7,11 @@ from rich.console import Console
 
 
 UNICODE_FALLBACKS = (
-    ("✓", "[OK]"),
-    ("✗", "[X]"),
-    ("⚠", "[!]"),
-    ("○", "-"),
-    ("→", "->"),
-    ("📋", ""),
-    ("•", "-"),
-    ("┌", "+"),
-    ("┐", "+"),
-    ("└", "+"),
-    ("┘", "+"),
-    ("├", "+"),
-    ("┤", "+"),
-    ("┬", "+"),
-    ("┴", "+"),
-    ("┼", "+"),
-    ("│", "|"),
-    ("─", "-"),
+    ("?", "[OK]"),
+    ("?", "[X]"),
+    ("!", "[!]"),
+    ("?", "->"),
+    ("?", "-"),
 )
 
 UNICODE_PROBE = "".join(source for source, _ in UNICODE_FALLBACKS)
@@ -36,12 +23,9 @@ def _stream_encoding(stream: TextIO) -> str:
 
 def supports_unicode_output(stream: TextIO | None = None) -> bool:
     target = stream or sys.stdout
-    encoding = _stream_encoding(target)
     try:
-        UNICODE_PROBE.encode(encoding)
-    except UnicodeEncodeError:
-        return False
-    except LookupError:
+        UNICODE_PROBE.encode(_stream_encoding(target))
+    except (LookupError, UnicodeEncodeError):
         return False
     return True
 
@@ -49,7 +33,6 @@ def supports_unicode_output(stream: TextIO | None = None) -> bool:
 def normalize_output_text(text: str, stream: TextIO | None = None) -> str:
     if supports_unicode_output(stream):
         return text
-
     normalized = text
     for source, target in UNICODE_FALLBACKS:
         normalized = normalized.replace(source, target)
@@ -70,10 +53,6 @@ class SafeOutputStream:
     @property
     def encoding(self):
         return getattr(self.wrapped, "encoding", None)
-
-    @property
-    def errors(self):
-        return getattr(self.wrapped, "errors", None)
 
     def write(self, text: str) -> int:
         return self.wrapped.write(normalize_output_text(text, self.wrapped))

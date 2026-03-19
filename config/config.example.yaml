@@ -1,91 +1,27 @@
-# PaperInsight 配置示例
-# 该文件按当前运行时代码 paperinsight/utils/config.py::DEFAULT_CONFIG 对齐整理。
-# 建议先运行 `paperinsight config` 生成 ~/.paperinsight/config.yaml，再按需参考本文件微调。
-
 mineru:
   enabled: true
-  mode: "api"  # api 或 cli
+  mode: api
   token: ""
-  api_url: "https://mineru.net/api/v4"
+  api_url: https://mineru.net/api/v4
   timeout: 600
-  model_version: "vlm"  # pipeline / vlm / MinerU-HTML
-  output_format: "markdown"
+  model_version: vlm
+  output_format: markdown
   extract_tables: true
-  method: "auto"  # auto / txt / ocr
-
-paddlex:
-  enabled: false
-  token: ""
-  model: "PaddleOCR-VL-1.5"
-  use_doc_orientation: false
-  use_doc_unwarping: false
-  use_layout_detection: true
-  use_chart_recognition: false
-  timeout: 300
-  poll_interval: 5
+  method: auto
+  download_retries: 3
+  download_backoff: 1.5
+  allow_insecure_result_download: true
 
 llm:
   enabled: true
-  provider: "longcat"  # longcat / openai / deepseek / wenxin
+  provider: longcat
   api_key: ""
-  model: "LongCat-Flash-Chat"
-  base_url: ""
   timeout: 120
-  max_retries: 3
-  wenxin:
-    client_id: ""
-    client_secret: ""
-    model: "ernie-4.0-8k"
-  deepseek:
-    model: "deepseek-chat"
-  openai:
-    model: "gpt-4o"
-    organization: ""
   longcat:
-    model: "LongCat-Flash-Chat"
-    base_url: "https://api.longcat.chat/openai"
-    backfill_model: "LongCat-Flash-Lite"
+    model: LongCat-Flash-Chat
+    base_url: https://api.longcat.chat/openai
+    backfill_model: LongCat-Flash-Lite
     enable_lite_backfill: true
-
-web_search:
-  enabled: true
-  timeout: 30
-  resolve_journal_metadata: true
-  fetch_official_impact_factor: true
-  correct_existing_impact_factor: true
-  use_ai_model_if: false
-  ai_model_if:
-    enabled: false
-    timeout: 60
-    headless: true
-    delay: 2.0
-    qianwen_api_key: ""
-    kimi_api_key: ""
-  search_crawler:
-    enabled: true
-    market: "en-US"
-  web_of_science:
-    enabled: false
-    api_key: ""
-    journals_api_url: "https://api.clarivate.com/apis/wos-journals/v1"
-
-cache:
-  enabled: true
-  directory: ".cache"
-  max_age_days: 30
-
-output:
-  format: ["excel"]
-  sort_by_if: true
-  generate_error_log: true
-  rename_pdfs: false
-  rename_template: "[{year}_{impact_factor}_{journal}]_{title}.pdf"
-  include_source: true
-  bilingual_text: false
-
-pdf:
-  max_pages: 0
-  text_ratio_threshold: 0.1
 
 cleaner:
   enabled: true
@@ -94,28 +30,13 @@ cleaner:
   max_blocks: 80
   min_block_score: 3.0
   keep_table_context: true
-  remove_sections:
-    - "references"
-    - "acknowledgments"
-    - "author contributions"
-    - "supplementary material"
-    - "conflict of interest"
-    - "data availability"
-  keep_sections:
-    - "abstract"
-    - "introduction"
-    - "experimental"
-    - "results"
-    - "discussion"
-    - "conclusion"
 
-desktop:
-  engine:
-    mode: "bundled"  # bundled / system_python
-    python_path: ""
-    backend_path: ""
-  ui:
-    last_pdf_dir: ""
-    last_output_dir: ""
-    remember_last_paths: true
-    onboarding_completed: false
+cache:
+  enabled: true
+  directory: .cache
+  max_age_days: 30
+
+output:
+  format: [excel]
+  sort_by_if: true
+  bilingual_text: false

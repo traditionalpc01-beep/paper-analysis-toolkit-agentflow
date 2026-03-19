@@ -1,135 +1,164 @@
-# PaperInsight CLI
+# PaperInsight AgentFlow
 
-基于当前仓库实现整理的论文分析工具说明。本文只写 2026-03-18 在仓库中可以直接核查的事实；历史版本的设计目标请看对应 PRD 文档。
+`PaperInsight AgentFlow` is a clean, agent-first PDF paper analysis toolkit.
+It keeps the refactored workflow only:
 
-当前版本：`3.0.7`
+1. Use MinerU API to turn each PDF into Markdown.
+2. Use IDE agents or web-enabled tools to match the paper and fill journal + latest impact factor.
+3. Use Longcat to extract the remaining metrics from the Markdown, one paper per thread.
+4. Merge identity data and metrics data into Excel/JSON reports.
+5. Return the final report path after the run finishes.
 
-## 已核实的能力
+## What This Repo Contains
 
-- 命令行入口由 `paperinsight` 提供，当前可用子命令包括 `analyze`、`config`、`version`、`doctor`、`check`、`cache-info`、`clear-cache`。
-- 默认分析链路为：PDF 解析 -> 文本清洗 -> 数据提取 -> 影响因子补全/校正 -> Excel/JSON 导出。
-- 当前仓库同时保留两种运行思路：`api` 模式优先启用 LLM/联网能力，`regex` 模式走本地兜底提取。
-- 缓存按 PDF 的 MD5 指纹保存，当前缓存文件命名为 `<md5>_data.json`、`<md5>_markdown.md`，并兼容旧版 `<md5>_ocr.md`。
-- 默认输出目录是输入 PDF 目录下的 `输出结果/`，默认报告文件名是带时间戳的 `论文分析报告_<YYYYMMDD_HHMMSS>.xlsx`；启用 `--json` 后会额外生成同名前缀的 `.json` 文件。
-- 仓库还包含一个 `React + Electron + Python` 的桌面壳，开发命令和 Windows 打包流程分别在 `desktop/package.json` 与 `.github/workflows/` 中可核查。
+- A focused CLI for the new agent-first workflow.
+- MinerU parser integration with retry and SSL EOF download fallback.
+- Longcat-based metric extraction.
+- Incremental finalization that merges `03_paper_data.json` and `04_metrics_result.json`.
+- Minimal tests covering the new flow only.
 
-## 安装
+## Project Layout
 
-### 基础安装
+- `paperinsight/cli.py`: CLI entrypoint.
+- `paperinsight/agentflow/`: prepare, identity import, metrics extraction, finalize.
+- `paperinsight/parser/mineru.py`: MinerU API adapter.
+- `paperinsight/core/extractor.py`: Longcat-driven metric extraction.
+- `paperinsight/core/reporter.py`: Excel/JSON export.
+- `paperinsight/models/schemas.py`: shared paper schema.
+- `docs/AGENTFLOW.md`: stage-by-stage artifact contract.
+- `docs/PROJECT_LAYOUT.md`: compact module map.
+
+## Install
 
 ```bash
-git clone https://github.com/traditionalpc01-beep/paper-analysis-toolkit.git
-cd paper-analysis-toolkit
+git clone <your-repo-url>
+cd paper-analysis-toolkit-agentflow
 pip install -r requirements.txt
 pip install -e .
 ```
 
-### 按能力补充依赖
+## Configuration
 
-```bash
-# LLM 提取（OpenAI / DeepSeek / Longcat 当前都依赖 openai Python SDK）
-pip install openai
+Runtime config is loaded from `~/.paperinsight/config.yaml`.
+The repo only keeps `config/config.example.yaml` as a template.
 
-# 本地 OCR 兜底
-pip install paddlepaddle paddleocr
+Required keys for the refactored flow:
 
-# MinerU 本地 CLI 解析
-pip install mineru
+- `mineru.token`
+- `llm.api_key`
+- `llm.provider=longcat`
 
-# 实验性 AI 影响因子补全的附加依赖已包含在 requirements.txt / pyproject.toml 中
+Copy the example if you need a fresh local config:
+
+```powershell
+New-Item -ItemType Directory -Force "$HOME/.paperinsight" | Out-Null
+Copy-Item config/config.example.yaml "$HOME/.paperinsight/config.yaml"
 ```
 
-## 推荐启动顺序
+Sensitive fields are encrypted before saving by `paperinsight.utils.config_crypto`.
+
+## CLI Workflow
+
+### 1) Prepare MinerU outputs
 
 ```bash
-paperinsight check
-paperinsight config
-paperinsight analyze ./pdfs
+paperinsight agent prepare ./pdfs
 ```
 
-说明：
+Output per paper:
 
-- `check` 做快速环境检查。
-- `config` 运行交互式配置向导，默认会先引导配置 Longcat，再配置 MinerU。
-- `analyze` 会根据参数或当前配置选择 `api` / `regex` 模式。
+- `01_parse.md`
+- `01_parse_meta.json`
+- `02_identity_job.json`
 
-## 常用命令
+Run-level artifacts:
+
+- `manifest.json`
+- `jobs/identity_jobs.jsonl`
+- `jobs/identity_results.jsonl`
+- `jobs/identity_prompt.md`
+
+### 2) Import identity matching results
+
+Fill `jobs/identity_results.jsonl` with one JSON line per paper, then run:
 
 ```bash
-# 默认分析（auto 模式）
-paperinsight analyze ./pdfs
-
-# 强制本地兜底模式
-paperinsight analyze ./pdfs --mode regex
-
-# 强制 API 模式
-paperinsight analyze ./pdfs --mode api
-
-# 递归扫描并额外导出 JSON
-paperinsight analyze ./pdfs --recursive --json
-
-# 关闭缓存重跑
-paperinsight analyze ./pdfs --no-cache
-
-# 分析完成后重命名 PDF
-paperinsight analyze ./pdfs --rename-pdfs
-
-# LLM 开启时导出中英双语字段
-paperinsight analyze ./pdfs --bilingual
+paperinsight agent import-identity <run_dir>
 ```
 
-## 输出与报表
+This generates:
 
-默认输出目录：`<PDF目录>/输出结果/`
+- `03_identity_result.json`
+- `03_paper_data.json`
 
-典型输出文件：
+### 3) Extract metrics with Longcat
 
-- `论文分析报告_<时间戳>.xlsx`
-- `论文分析报告_<时间戳>.json`（仅在 `--json` 或输出格式包含 `json` 时生成）
-- `error_log.txt`（仅在有错误时生成）
+```bash
+paperinsight agent extract-metrics <run_dir>
+```
 
-Excel 当前固定导出 20 列，字段来自 `paperinsight/core/reporter.py::REPORT_COLUMNS`；列级来源说明见 `Excel导出列数据来源说明.md`。
+This generates:
 
-## 配置与安全
+- `04_metrics_result.json`
+- `04_metrics_meta.json`
 
-- 运行时配置文件路径是 `~/.paperinsight/config.yaml`。
-- 运行时默认值来自 `paperinsight/utils/config.py::DEFAULT_CONFIG`；仓库内的 `config/config.example.yaml` 是示例文件，不保证与运行时默认值完全一致。
-- 敏感字段会写入本地配置文件前做简单加密/混淆：本地密钥 + XOR + Base64；配置文件和密钥文件都会尝试设置为 `0600` 权限。
-- 当前运行时默认值中：`mineru.mode` 为 `api`，`output.format` 为 `['excel']`，`llm.provider` 为 `longcat`。
+Recommended usage: one paper per clean thread so the model stays inside context limits.
 
-## 文档索引
+### 4) Finalize reports
 
-- [快速开始指南](./使用文档/快速开始指南.md)
-- [高级配置说明](./使用文档/高级配置说明.md)
-- [使用示例](./使用文档/使用示例.md)
-- [常见问题解答](./使用文档/常见问题解答.md)
-- [AI 模型影响因子获取说明](./使用文档/AI模型影响因子获取说明.md)
-- [Excel 导出列数据来源说明](./Excel导出列数据来源说明.md)
-- [2.0 版本 PRD（归档整理版）](./2.0版本prd.md)
-- [3.0 版本 PRD（实现对照版）](./3.0版本prd.md)
-- [3.1 版本 PRD（实现对照版）](./3.1版本prd.md)
+```bash
+paperinsight agent finalize <run_dir> --json
+```
 
-## 可核查来源
+Finalize behavior:
 
-### 仓库内
+- prefers `04_metrics_result.json`
+- overlays identity fields from `03_paper_data.json`
+- falls back to `03_paper_data.json` when metrics are missing
+- exports incomplete rows instead of silently dropping papers
 
-- `paperinsight/__init__.py`
-- `pyproject.toml`
-- `requirements.txt`
-- `paperinsight/cli.py`
-- `paperinsight/core/pipeline.py`
-- `paperinsight/core/reporter.py`
-- `paperinsight/core/cache.py`
-- `paperinsight/utils/config.py`
-- `paperinsight/utils/config_crypto.py`
-- `desktop/package.json`
-- `.github/workflows/build-desktop-windows.yml`
-- `.github/workflows/build-windows-package.yml`
+Generated outputs:
 
-### 外部官方文档
+- `reports/paperinsight_report_<timestamp>.xlsx`
+- `reports/paperinsight_report_<timestamp>.json`
 
-- MinerU 官方文档：<https://mineru.net/apiManage/docs>
-- MinerU GitHub 仓库：<https://github.com/opendatalab/MinerU>
-- Crossref REST API：<https://www.crossref.org/documentation/retrieve-metadata/rest-api/>
-- 阿里云 DashScope OpenAI 兼容调用：<https://help.aliyun.com/zh/model-studio/developer-reference/compatibility-of-openai-with-dashscope>
-- Moonshot AI Kimi API 快速开始：<https://platform.moonshot.cn/blog/posts/kimi-api-quick-start-guide>
+The CLI prints the final report path directly.
+
+## Artifact Contract
+
+A typical run looks like this:
+
+```text
+agent_runs/
+  run_20260319_120000/
+    manifest.json
+    jobs/
+      identity_jobs.jsonl
+      identity_results.jsonl
+      metrics_summary.json
+      finalize_summary.json
+    papers/
+      0001_sample_abcd1234/
+        01_parse.md
+        01_parse_meta.json
+        02_identity_job.json
+        03_identity_result.json
+        03_paper_data.json
+        04_metrics_result.json
+        04_metrics_meta.json
+        05_final_paper_data.json
+    reports/
+      paperinsight_report_20260319_122253.xlsx
+      paperinsight_report_20260319_122253.json
+```
+
+## Validation
+
+```bash
+python -m pytest tests/test_agentflow_prepare.py tests/test_api_integrations.py tests/test_project_layout.py -q
+```
+
+## Current Scope
+
+This cleaned project intentionally does not keep the old desktop shell, legacy web crawlers, packaging scripts, PRD archives, or unrelated regression suites.
+The repo now starts from the refactored agent-first workflow only.
