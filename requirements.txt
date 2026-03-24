@@ -24,6 +24,9 @@ pyyaml>=6.0
 # 网络请求
 requests>=2.31.0
 
+# 重试机制
+tenacity>=8.2.0
+
 # HTML 解析（实验性 AI 影响因子获取模块）
 beautifulsoup4>=4.12.0
 

@@ -32,6 +32,9 @@ class ReportGenerator:
         ("文件地址 URL", "url"),
         ("期刊名称 Journal", "journal"),
         ("影响因子 Impact Factor", "impact_factor"),
+        ("影响因子年份 IF Year", "impact_factor_year"),
+        ("影响因子来源 IF Source", "impact_factor_source"),
+        ("影响因子状态 IF Status", "impact_factor_status"),
         ("作者 Authors", "authors"),
         ("处理结果/简述 Processing Status", "processing_status"),
         ("论文标题 Title", "title"),
@@ -174,6 +177,9 @@ class ReportGenerator:
             "url": 45,
             "journal": 28,
             "impact_factor": 16,
+            "impact_factor_year": 14,
+            "impact_factor_source": 24,
+            "impact_factor_status": 22,
             "authors": 25,
             "processing_status": 34,
             "title": 50,
@@ -258,7 +264,19 @@ class ReportGenerator:
             return json.dumps(value, ensure_ascii=False)
 
         if field_key == "impact_factor":
+            if value in (None, ""):
+                return ""
             return self._coerce_if_value(value)
+
+        if field_key == "impact_factor_year":
+            if value in (None, ""):
+                return ""
+            if isinstance(value, int):
+                return value
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return str(value)
 
         return str(value) if value not in (None, "") else ""
     

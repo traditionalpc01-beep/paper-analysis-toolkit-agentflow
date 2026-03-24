@@ -103,6 +103,30 @@ def test_fetcher_parses_jif_key_with_embedded_year():
     assert result.impact_factor == 49.9
 
 
+def test_fetcher_prefers_latest_jif_year_over_older_higher_value():
+    session = DummySession(
+        [
+            DummyResponse(
+                {
+                    "journalProfile": {
+                        "indicators": {
+                            "jif2024": "11.2",
+                            "jif2023": "15.8",
+                        }
+                    }
+                }
+            )
+        ]
+    )
+    fetcher = MJLImpactFactorFetcher(session=session)
+
+    result = fetcher.lookup(_candidate())
+
+    assert result.status == "OK"
+    assert result.year == 2024
+    assert result.impact_factor == 11.2
+
+
 def test_fetcher_marks_not_visible_when_profile_has_no_jif_data():
     session = DummySession([DummyResponse({"journalProfile": {"title": "Nature"}})])
     fetcher = MJLImpactFactorFetcher(session=session)

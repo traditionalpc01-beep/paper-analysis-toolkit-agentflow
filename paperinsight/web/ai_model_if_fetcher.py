@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from typing import Iterable, Optional
@@ -21,6 +22,11 @@ import requests
 from bs4 import BeautifulSoup
 
 from paperinsight.web.impact_factor_fetcher import ImpactFactorLookupResult
+from paperinsight.web.journal_if_database import (
+    JOURNAL_IF_DATABASE,
+    get_journal_if_record,
+    validate_if_for_journal,
+)
 
 
 class LetPubFetcher:
@@ -147,74 +153,16 @@ class LetPubFetcher:
 
 class JournalIFCache:
     """期刊影响因子缓存"""
-    
-    # 常用期刊的IF值缓存（2024年数据）
-    CACHE = {
-        # 顶级期刊
-        "nature": 50.5,
-        "science": 44.7,
-        "cell": 45.5,
-        # 材料科学
-        "advanced materials": 26.8,
-        "adv. mater.": 26.8,
-        "advanced functional materials": 18.5,
-        "adv. funct. mater.": 18.5,
-        "nano letters": 10.8,
-        "nano lett.": 10.8,
-        "acs nano": 16.0,
-        # 化学期刊
-        "journal of the american chemical society": 15.6,
-        "j. am. chem. soc.": 15.6,
-        "jacs": 15.6,
-        "angewandte chemie": 16.1,
-        "angew. chem.": 16.1,
-        "chemical reviews": 52.8,
-        "chem. rev.": 52.8,
-        # 物理期刊
-        "physical review letters": 8.1,
-        "phys. rev. lett.": 8.1,
-        "prl": 8.1,
-        # 光学期刊
-        "light: science & applications": 20.6,
-        "laser & photonics reviews": 9.8,
-        "acs photonics": 6.8,
-        # 纳米期刊
-        "small": 13.0,
-        "nanoscale": 5.8,
-        "nano research": 9.9,
-        "nano res.": 9.9,
-        "journal of materials chemistry a": 10.7,
-        "j. mater. chem. a": 10.7,
-        # 量子点相关
-        "journal of physical chemistry c": 3.7,
-        "j. phys. chem. c": 3.7,
-        # 半导体
-        "applied physics letters": 3.5,
-        "appl. phys. lett.": 3.5,
-        # 能源
-        "journal of power sources": 8.1,
-        # 其他
-        "not specified in text": None,
-    }
-    
+
     @classmethod
     def get(cls, journal_name: str) -> Optional[float]:
         """获取缓存的影响因子"""
         if not journal_name:
             return None
-        
-        # 标准化期刊名称
-        normalized = journal_name.lower().strip()
-        
-        # 直接匹配
-        if normalized in cls.CACHE:
-            return cls.CACHE[normalized]
-        
-        # 模糊匹配
-        for key, value in cls.CACHE.items():
-            if key in normalized or normalized in key:
-                return value
-        
+
+        record = get_journal_if_record(journal_name)
+        if record:
+            return record.if_value
         return None
 
 
@@ -285,13 +233,14 @@ class XMOLFetcher:
 
 class QianwenAPIFetcher:
     """通义千问API获取影响因子（兜底）"""
-    
+
     API_URL = "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
-    
+
     def __init__(self, api_key: Optional[str] = None, timeout: int = 60):
         self.api_key = api_key
         self.timeout = timeout
-    
+        self.logger = logging.getLogger(__name__)
+
     def lookup(self, paper_title: str, journal_name: Optional[str] = None) -> ImpactFactorLookupResult:
         """通过通义千问API查询影响因子"""
         if not self.api_key:
@@ -301,31 +250,31 @@ class QianwenAPIFetcher:
                 source_url="",
                 error_message="未配置API Key",
             )
-        
+
         try:
             headers = {
                 'Authorization': f'Bearer {self.api_key}',
                 'Content-Type': 'application/json',
             }
-            
+
             if journal_name:
-                prompt = f"请查询期刊「{journal_name}」的影响因子（IF），只返回数值，不要其他解释。"
+                prompt = self._build_prompt(journal_name)
             else:
-                prompt = f"请查询论文「{paper_title}」所在期刊的影响因子（IF），只返回数值，不要其他解释。"
-            
+                prompt = self._build_prompt_for_paper(paper_title)
+
             data = {
                 "model": "qwen-turbo",
                 "input": {"prompt": prompt},
                 "parameters": {}
             }
-            
+
             response = requests.post(
                 self.API_URL,
                 headers=headers,
                 json=data,
                 timeout=self.timeout
             )
-            
+
             if response.status_code != 200:
                 return ImpactFactorLookupResult(
                     status="ERROR",
@@ -333,14 +282,23 @@ class QianwenAPIFetcher:
                     source_url="",
                     error_message=f"API调用失败: {response.status_code}",
                 )
-            
+
             result = response.json()
             output_text = result.get('output', {}).get('text', '')
-            
-            # 提取IF值
-            if_value = self._extract_if_from_text(output_text)
-            
-            if if_value:
+
+            if_value = self._extract_if_from_text(output_text, journal_name)
+
+            if if_value is not None:
+                is_valid, reason = validate_if_for_journal(journal_name or paper_title, if_value)
+                if not is_valid:
+                    self.logger.warning(f"[QianwenAPI] IF validation failed: {reason}")
+                    return ImpactFactorLookupResult(
+                        status="VALIDATION_FAILED",
+                        source_name="QIANWEN_API",
+                        source_url="",
+                        impact_factor=if_value,
+                        error_message=f"IF值验证失败: {reason}",
+                    )
                 return ImpactFactorLookupResult(
                     status="OK",
                     source_name="QIANWEN_API",
@@ -355,7 +313,7 @@ class QianwenAPIFetcher:
                     source_url="",
                     error_message=f"未能解析IF值: {output_text[:100]}",
                 )
-                
+
         except Exception as e:
             return ImpactFactorLookupResult(
                 status="ERROR",
@@ -363,34 +321,74 @@ class QianwenAPIFetcher:
                 source_url="",
                 error_message=f"查询异常: {str(e)}",
             )
-    
-    def _extract_if_from_text(self, text: str) -> Optional[float]:
+
+    def _build_prompt(self, journal_name: str) -> str:
+        """构建查询期刊IF的prompt"""
+        return (
+            f"请查询期刊「{journal_name}」的2024年影响因子（Impact Factor，IF）。"
+            f"只返回一个数字，例如：15.6"
+            f"如果不是期刊名称，请返回ERROR。"
+        )
+
+    def _build_prompt_for_paper(self, paper_title: str) -> str:
+        """构建查询论文IF的prompt"""
+        return (
+            f"论文标题：「{paper_title}」"
+            f"请查询这篇论文所在期刊的2024年影响因子（Impact Factor，IF）。"
+            f"只返回一个数字，例如：15.6"
+            f"如果无法确定期刊，请返回ERROR。"
+        )
+
+    def _extract_if_from_text(self, text: str, journal_name: Optional[str] = None) -> Optional[float]:
         """从文本中提取IF值"""
-        patterns = [
-            r'([0-9]+(?:\.[0-9]+)?)',
-        ]
-        
-        for pattern in patterns:
-            matches = re.findall(pattern, text)
-            for match in matches:
-                try:
-                    value = float(match)
-                    if 0.1 <= value <= 300:
-                        return value
-                except ValueError:
-                    continue
+        if not text:
+            return None
+
+        text = text.strip()
+
+        if re.search(r"error|无法确定|不知道|无法查询|no.*if|not.*found", text, re.IGNORECASE):
+            return None
+
+        known_record = get_journal_if_record(journal_name) if journal_name else None
+        if known_record:
+            expected_if = known_record.if_value
+            min_if = expected_if * 0.5
+            max_if = expected_if * 1.5
+            pattern = rf"({min_if:.1f}|{max_if:.1f}|{expected_if:.1f}|[0-9]{{1,2}}\.[0-9]+)"
+        else:
+            pattern = r"([0-9]+\.[0-9]+|[0-9]{2})"
+
+        matches = re.findall(pattern, text)
+        for match in matches:
+            try:
+                value = float(match)
+                if 0.1 <= value <= 200:
+                    return value
+            except ValueError:
+                continue
+
+        simple_match = re.search(r"([0-9]+\.?[0-9]*)", text)
+        if simple_match:
+            try:
+                value = float(simple_match.group(1))
+                if 1.0 <= value <= 100:
+                    return value
+            except ValueError:
+                pass
+
         return None
 
 
 class KimiAPIFetcher:
     """Kimi API获取影响因子（兜底）"""
-    
+
     API_URL = "https://api.moonshot.cn/v1/chat/completions"
-    
+
     def __init__(self, api_key: Optional[str] = None, timeout: int = 60):
         self.api_key = api_key
         self.timeout = timeout
-    
+        self.logger = logging.getLogger(__name__)
+
     def lookup(self, paper_title: str, journal_name: Optional[str] = None) -> ImpactFactorLookupResult:
         """通过Kimi API查询影响因子"""
         if not self.api_key:
@@ -400,18 +398,18 @@ class KimiAPIFetcher:
                 source_url="",
                 error_message="未配置API Key",
             )
-        
+
         try:
             headers = {
                 'Authorization': f'Bearer {self.api_key}',
                 'Content-Type': 'application/json',
             }
-            
+
             if journal_name:
-                prompt = f"请查询期刊「{journal_name}」的影响因子（IF），只返回数值，不要其他解释。"
+                prompt = self._build_prompt(journal_name)
             else:
-                prompt = f"请查询论文「{paper_title}」所在期刊的影响因子（IF），只返回数值，不要其他解释。"
-            
+                prompt = self._build_prompt_for_paper(paper_title)
+
             data = {
                 "model": "moonshot-v1-8k",
                 "messages": [
@@ -419,14 +417,14 @@ class KimiAPIFetcher:
                 ],
                 "temperature": 0.1
             }
-            
+
             response = requests.post(
                 self.API_URL,
                 headers=headers,
                 json=data,
                 timeout=self.timeout
             )
-            
+
             if response.status_code != 200:
                 return ImpactFactorLookupResult(
                     status="ERROR",
@@ -434,13 +432,23 @@ class KimiAPIFetcher:
                     source_url="",
                     error_message=f"API调用失败: {response.status_code}",
                 )
-            
+
             result = response.json()
             output_text = result.get('choices', [{}])[0].get('message', {}).get('content', '')
-            
-            if_value = self._extract_if_from_text(output_text)
-            
-            if if_value:
+
+            if_value = self._extract_if_from_text(output_text, journal_name)
+
+            if if_value is not None:
+                is_valid, reason = validate_if_for_journal(journal_name or paper_title, if_value)
+                if not is_valid:
+                    self.logger.warning(f"[KimiAPI] IF validation failed: {reason}")
+                    return ImpactFactorLookupResult(
+                        status="VALIDATION_FAILED",
+                        source_name="KIMI_API",
+                        source_url="",
+                        impact_factor=if_value,
+                        error_message=f"IF值验证失败: {reason}",
+                    )
                 return ImpactFactorLookupResult(
                     status="OK",
                     source_name="KIMI_API",
@@ -455,7 +463,7 @@ class KimiAPIFetcher:
                     source_url="",
                     error_message=f"未能解析IF值: {output_text[:100]}",
                 )
-                
+
         except Exception as e:
             return ImpactFactorLookupResult(
                 status="ERROR",
@@ -463,35 +471,76 @@ class KimiAPIFetcher:
                 source_url="",
                 error_message=f"查询异常: {str(e)}",
             )
-    
-    def _extract_if_from_text(self, text: str) -> Optional[float]:
+
+    def _build_prompt(self, journal_name: str) -> str:
+        """构建查询期刊IF的prompt"""
+        return (
+            f"请查询期刊「{journal_name}」的2024年影响因子（Impact Factor，IF）。"
+            f"只返回一个数字，例如：15.6"
+            f"如果不是期刊名称，请返回ERROR。"
+        )
+
+    def _build_prompt_for_paper(self, paper_title: str) -> str:
+        """构建查询论文IF的prompt"""
+        return (
+            f"论文标题：「{paper_title}」"
+            f"请查询这篇论文所在期刊的2024年影响因子（Impact Factor，IF）。"
+            f"只返回一个数字，例如：15.6"
+            f"如果无法确定期刊，请返回ERROR。"
+        )
+
+    def _extract_if_from_text(self, text: str, journal_name: Optional[str] = None) -> Optional[float]:
         """从文本中提取IF值"""
-        patterns = [r'([0-9]+(?:\.[0-9]+)?)']
-        
-        for pattern in patterns:
-            matches = re.findall(pattern, text)
-            for match in matches:
-                try:
-                    value = float(match)
-                    if 0.1 <= value <= 300:
-                        return value
-                except ValueError:
-                    continue
+        if not text:
+            return None
+
+        text = text.strip()
+
+        if re.search(r"error|无法确定|不知道|无法查询|no.*if|not.*found", text, re.IGNORECASE):
+            return None
+
+        known_record = get_journal_if_record(journal_name) if journal_name else None
+        if known_record:
+            expected_if = known_record.if_value
+            min_if = expected_if * 0.5
+            max_if = expected_if * 1.5
+            pattern = rf"({min_if:.1f}|{max_if:.1f}|{expected_if:.1f}|[0-9]{{1,2}}\.[0-9]+)"
+        else:
+            pattern = r"([0-9]+\.[0-9]+|[0-9]{2})"
+
+        matches = re.findall(pattern, text)
+        for match in matches:
+            try:
+                value = float(match)
+                if 0.1 <= value <= 200:
+                    return value
+            except ValueError:
+                continue
+
+        simple_match = re.search(r"([0-9]+\.?[0-9]*)", text)
+        if simple_match:
+            try:
+                value = float(simple_match.group(1))
+                if 1.0 <= value <= 100:
+                    return value
+            except ValueError:
+                pass
+
         return None
 
 
 class AIModelImpactFactorFetcher:
     """
     综合影响因子获取器
-    
+
     优先级：
     1. 本地缓存（最快）
     2. LetPub网站爬虫（期刊名称查询）
     3. AI API兜底（需要配置API Key）
     """
-    
+
     def __init__(
-        self, 
+        self,
         timeout: int = 30,
         headless: bool = True,
         qianwen_api_key: Optional[str] = None,
@@ -506,8 +555,6 @@ class AIModelImpactFactorFetcher:
         self.xmol_fetcher = XMOLFetcher(timeout=timeout)
         self.qianwen_fetcher = QianwenAPIFetcher(api_key=qianwen_api_key, timeout=timeout)
         self.kimi_fetcher = KimiAPIFetcher(api_key=kimi_api_key, timeout=timeout)
-        
-        # 常用期刊标题关键词映射
         self._title_journal_hints = {
             "advanced materials": "Advanced Materials",
             "adv. mater.": "Advanced Materials",

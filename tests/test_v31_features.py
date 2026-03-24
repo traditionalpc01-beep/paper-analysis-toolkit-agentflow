@@ -8,6 +8,7 @@ from paperinsight.core.extractor import DataExtractor
 from paperinsight.core.pipeline import AnalysisPipeline
 from paperinsight.models.schemas import PaperData, PaperInfo
 from paperinsight.parser.base import ParseResult
+from paperinsight.web.impact_factor_fetcher import ImpactFactorLookupResult
 
 
 runner = CliRunner()
@@ -164,6 +165,17 @@ def test_pipeline_can_correct_existing_impact_factor_when_web_result_differs(tmp
                 year=2023,
             )
 
+        def lookup_by_title(self, journal_title):
+            from paperinsight.web.impact_factor_fetcher import ImpactFactorLookupResult
+
+            return ImpactFactorLookupResult(
+                status="OK",
+                source_name="MJL_PROFILE_API",
+                source_url="https://mjl.clarivate.com/api/mjl/jprof/restricted/seqno/12345J?searchIdentifier=search-id-1",
+                impact_factor=18.9,
+                year=2023,
+            )
+
     pipeline.journal_resolver = DummyResolver()
     pipeline.if_fetcher = DummyFetcher()
     paper_data = PaperData(
@@ -184,7 +196,7 @@ def test_pipeline_can_correct_existing_impact_factor_when_web_result_differs(tmp
     assert paper_data.paper_info.impact_factor == 18.9
     assert paper_data.paper_info.impact_factor_year == 2023
     assert paper_data.paper_info.impact_factor_source == "MJL_PROFILE_API"
-    assert paper_data.paper_info.impact_factor_status == "OK"
+    assert paper_data.paper_info.impact_factor_status == "OK_VALIDATED"
 
 
 def test_pipeline_marks_no_access_when_official_if_requires_login(tmp_path):
@@ -228,6 +240,15 @@ def test_pipeline_marks_no_access_when_official_if_requires_login(tmp_path):
 
     class DummyFetcher:
         def lookup(self, candidate):
+            from paperinsight.web.impact_factor_fetcher import ImpactFactorLookupResult
+
+            return ImpactFactorLookupResult(
+                status="NO_ACCESS",
+                source_name="MJL_PROFILE_API",
+                source_url="https://mjl.clarivate.com/api/mjl/jprof/restricted/seqno/70884J?searchIdentifier=search-id-1",
+            )
+
+        def lookup_by_title(self, journal_title):
             from paperinsight.web.impact_factor_fetcher import ImpactFactorLookupResult
 
             return ImpactFactorLookupResult(
@@ -304,6 +325,15 @@ def test_pipeline_can_fetch_if_status_with_issn_only_metadata(tmp_path):
                 source_url="https://mjl.clarivate.com/api/mjl/jprof/restricted/seqno/C6855J?searchIdentifier=search-id-1",
             )
 
+        def lookup_by_title(self, journal_title):
+            from paperinsight.web.impact_factor_fetcher import ImpactFactorLookupResult
+
+            return ImpactFactorLookupResult(
+                status="NO_ACCESS",
+                source_name="MJL_PROFILE_API",
+                source_url="https://mjl.clarivate.com/api/mjl/jprof/restricted/seqno/C6855J?searchIdentifier=search-id-1",
+            )
+
     pipeline.journal_resolver = DummyResolver()
     pipeline.if_fetcher = DummyFetcher()
     paper_data = PaperData(
@@ -315,10 +345,375 @@ def test_pipeline_can_fetch_if_status_with_issn_only_metadata(tmp_path):
     resolution = pipeline._resolve_journal_metadata(paper_data)
     pipeline._supplement_impact_factor(paper_data, resolution)
 
-    assert paper_data.paper_info.journal_name == "Mater. Today"
+    assert paper_data.paper_info.matched_journal_title == "Mater. Today"
     assert paper_data.paper_info.match_method == "issn"
     assert paper_data.paper_info.impact_factor_source == "MJL_PROFILE_API"
     assert paper_data.paper_info.impact_factor_status == "NO_ACCESS"
+
+
+def test_pipeline_prefers_latest_secondary_if_year_when_official_unavailable(tmp_path):
+    pipeline = AnalysisPipeline(
+        output_dir=tmp_path,
+        config={
+            "cache": {"enabled": False},
+            "mineru": {"enabled": False},
+            "llm": {"enabled": False},
+            "web_search": {
+                "enabled": True,
+                "resolve_journal_metadata": True,
+                "fetch_official_impact_factor": True,
+                "correct_existing_impact_factor": True,
+            },
+        },
+    )
+
+    selected = pipeline._select_validated_impact_factor_result(
+        letpub_result=None,
+        secondary_results=[
+            ImpactFactorLookupResult(
+                status="OK",
+                source_name="CURATED_FALLBACK",
+                source_url="https://example.test/fallback",
+                impact_factor=13.3,
+                year=2022,
+            ),
+            ImpactFactorLookupResult(
+                status="OK",
+                source_name="SEARCH_CRAWLER",
+                source_url="https://example.test/search",
+                impact_factor=13.1,
+                year=2025,
+            ),
+        ],
+        tolerance=0.6,
+    )
+
+    assert selected is not None
+    assert selected.impact_factor == 13.1
+    assert selected.year == 2025
+    assert selected.source_name.startswith("SEARCH_CRAWLER")
+
+
+def test_pipeline_keeps_multi_match_status_instead_of_picking_arbitrary_candidate(tmp_path):
+    pipeline = AnalysisPipeline(
+        output_dir=tmp_path,
+        config={
+            "cache": {"enabled": False},
+            "mineru": {"enabled": False},
+            "llm": {"enabled": False},
+            "web_search": {
+                "enabled": True,
+                "resolve_journal_metadata": True,
+                "fetch_official_impact_factor": True,
+                "correct_existing_impact_factor": True,
+            },
+        },
+    )
+
+    class DummyResolver:
+        SEARCH_RESULTS_URL = "https://mjl.clarivate.com/search-results"
+
+        def resolve(self, journal_title=None, issn=None, eissn=None):
+            from paperinsight.web.journal_resolver import MJLJournalCandidate, MJLJournalResolution
+
+            return MJLJournalResolution(
+                status="MULTI_MATCH",
+                match_method="canonical_title",
+                search_value=journal_title,
+                candidates=(
+                    MJLJournalCandidate(
+                        publication_seq_no="A1",
+                        publication_title="SMALL METHODS",
+                        publication_title_iso="Small Methods",
+                        issn="2366-9608",
+                        eissn="2366-9608",
+                        publisher_name="Wiley",
+                        search_identifier="search-id-1",
+                        search_url="https://mjl.clarivate.com/search-results?search=Small",
+                        profile_url="https://mjl.clarivate.com/journal-profile",
+                    ),
+                    MJLJournalCandidate(
+                        publication_seq_no="A2",
+                        publication_title="SMALL SCIENCE",
+                        publication_title_iso="Small Science",
+                        issn="2688-4046",
+                        eissn="2688-4046",
+                        publisher_name="Wiley",
+                        search_identifier="search-id-1",
+                        search_url="https://mjl.clarivate.com/search-results?search=Small",
+                        profile_url="https://mjl.clarivate.com/journal-profile",
+                    ),
+                ),
+            )
+
+    class DummyFetcher:
+        def lookup(self, candidate):
+            raise AssertionError("official lookup should not run for unresolved MULTI_MATCH")
+
+        def lookup_by_title(self, journal_title):
+            raise AssertionError("title fallback should not run for unresolved MULTI_MATCH")
+
+    pipeline.journal_resolver = DummyResolver()
+    pipeline.if_fetcher = DummyFetcher()
+    pipeline.letpub_if_fetcher = None
+    pipeline.search_crawler_fetcher = None
+    pipeline.wos_if_fetcher = None
+    paper_data = PaperData(
+        paper_info=PaperInfo(
+            journal_name="Small",
+            raw_journal_title="Small",
+        )
+    )
+
+    resolution = pipeline._resolve_journal_metadata(paper_data)
+    pipeline._supplement_impact_factor(paper_data, resolution)
+
+    assert resolution is not None
+    assert resolution.status == "MULTI_MATCH"
+    assert paper_data.paper_info.impact_factor is None
+    assert paper_data.paper_info.impact_factor_source == "MJL_RESOLVER"
+    assert paper_data.paper_info.impact_factor_status == "MULTI_MATCH"
+    assert paper_data.paper_info.matched_journal_title is None
+
+
+def test_pipeline_falls_back_to_secondary_when_official_not_visible(tmp_path):
+    """NOT_VISIBLE 场景：官方无 JIF 数据时，应从次级来源获取 IF。"""
+    pipeline = AnalysisPipeline(
+        output_dir=tmp_path,
+        config={
+            "cache": {"enabled": False},
+            "mineru": {"enabled": False},
+            "llm": {"enabled": False},
+            "web_search": {
+                "enabled": True,
+                "resolve_journal_metadata": True,
+                "fetch_official_impact_factor": True,
+                "correct_existing_impact_factor": True,
+                "letpub": {"enabled": False},
+                "search_crawler": {"enabled": False},
+                "web_of_science": {"enabled": False},
+            },
+        },
+    )
+
+    class DummyResolver:
+        SEARCH_RESULTS_URL = "https://mjl.clarivate.com/search-results"
+
+        def resolve(self, journal_title=None, issn=None, eissn=None):
+            from paperinsight.web.journal_resolver import MJLJournalCandidate, MJLJournalResolution
+
+            return MJLJournalResolution(
+                status="OK",
+                match_method="issn",
+                search_value=issn,
+                candidate=MJLJournalCandidate(
+                    publication_seq_no="99999J",
+                    publication_title="ADVANCED MATERIALS",
+                    publication_title_iso="Adv. Mater.",
+                    issn="0935-9648",
+                    eissn="1521-4095",
+                    publisher_name="Wiley",
+                    search_identifier="search-id-adv",
+                    search_url="https://mjl.clarivate.com/search-results?issn=1521-4095",
+                    profile_url="https://mjl.clarivate.com/journal-profile",
+                ),
+            )
+
+    class DummyFetcher:
+        def lookup(self, candidate):
+            from paperinsight.web.impact_factor_fetcher import ImpactFactorLookupResult
+
+            return ImpactFactorLookupResult(
+                status="NOT_VISIBLE",
+                source_name="MJL_PROFILE_API",
+                source_url="https://mjl.clarivate.com/api/mjl/jprof/restricted/seqno/99999J",
+            )
+
+        def lookup_by_title(self, journal_title):
+            from paperinsight.web.impact_factor_fetcher import ImpactFactorLookupResult
+
+            return ImpactFactorLookupResult(
+                status="OK_STALE",
+                source_name="CURATED_FALLBACK",
+                source_url="https://example.test/fallback",
+                impact_factor=30.849,
+                year=2023,
+            )
+
+    pipeline.journal_resolver = DummyResolver()
+    pipeline.if_fetcher = DummyFetcher()
+    pipeline.letpub_if_fetcher = None
+    pipeline.search_crawler_fetcher = None
+    pipeline.wos_if_fetcher = None
+    paper_data = PaperData(
+        paper_info=PaperInfo(
+            journal_name="Advanced Materials",
+            raw_journal_title="Advanced Materials",
+            raw_eissn="1521-4095",
+        )
+    )
+
+    resolution = pipeline._resolve_journal_metadata(paper_data)
+    pipeline._supplement_impact_factor(paper_data, resolution)
+
+    assert paper_data.paper_info.matched_journal_title == "Adv. Mater."
+    assert paper_data.paper_info.impact_factor == 30.849
+    assert paper_data.paper_info.impact_factor_year == 2023
+    assert "CURATED_FALLBACK" in (paper_data.paper_info.impact_factor_source or "")
+    assert "OK" in (paper_data.paper_info.impact_factor_status or "")
+
+
+def test_pipeline_sets_correct_status_when_journal_no_match(tmp_path):
+    """NO_MATCH 场景：期刊解析返回 NO_MATCH 时，IF 状态应正确反映。"""
+    pipeline = AnalysisPipeline(
+        output_dir=tmp_path,
+        config={
+            "cache": {"enabled": False},
+            "mineru": {"enabled": False},
+            "llm": {"enabled": False},
+            "web_search": {
+                "enabled": True,
+                "resolve_journal_metadata": True,
+                "fetch_official_impact_factor": True,
+                "correct_existing_impact_factor": True,
+                "letpub": {"enabled": False},
+                "search_crawler": {"enabled": False},
+                "web_of_science": {"enabled": False},
+            },
+        },
+    )
+
+    class DummyResolver:
+        SEARCH_RESULTS_URL = "https://mjl.clarivate.com/search-results"
+
+        def resolve(self, journal_title=None, issn=None, eissn=None):
+            from paperinsight.web.journal_resolver import MJLJournalResolution
+
+            return MJLJournalResolution(
+                status="NO_MATCH",
+                match_method=None,
+                search_value=journal_title,
+            )
+
+    class DummyFetcher:
+        def lookup(self, candidate):
+            raise AssertionError("official lookup should not run for NO_MATCH")
+
+        def lookup_by_title(self, journal_title):
+            from paperinsight.web.impact_factor_fetcher import ImpactFactorLookupResult
+
+            return ImpactFactorLookupResult(
+                status="NO_MATCH",
+                source_name="CURATED_FALLBACK",
+                source_url="",
+            )
+
+    pipeline.journal_resolver = DummyResolver()
+    pipeline.if_fetcher = DummyFetcher()
+    pipeline.letpub_if_fetcher = None
+    pipeline.search_crawler_fetcher = None
+    pipeline.wos_if_fetcher = None
+    paper_data = PaperData(
+        paper_info=PaperInfo(
+            journal_name="Unknown Journal X",
+            raw_journal_title="Unknown Journal X",
+        )
+    )
+
+    resolution = pipeline._resolve_journal_metadata(paper_data)
+    pipeline._supplement_impact_factor(paper_data, resolution)
+
+    assert paper_data.paper_info.impact_factor is None
+    assert paper_data.paper_info.impact_factor_source is None or "MJL_RESOLVER" in paper_data.paper_info.impact_factor_source
+    assert paper_data.paper_info.impact_factor_status == "NO_MATCH"
+
+
+def test_pipeline_records_error_status_from_official_lookup(tmp_path):
+    """ERROR 场景：官方 API 返回 HTTP 500 时，状态应记录为 ERROR。"""
+    pipeline = AnalysisPipeline(
+        output_dir=tmp_path,
+        config={
+            "cache": {"enabled": False},
+            "mineru": {"enabled": False},
+            "llm": {"enabled": False},
+            "web_search": {
+                "enabled": True,
+                "resolve_journal_metadata": True,
+                "fetch_official_impact_factor": True,
+                "correct_existing_impact_factor": True,
+                "letpub": {"enabled": False},
+                "search_crawler": {"enabled": False},
+                "web_of_science": {"enabled": False},
+            },
+        },
+    )
+
+    class DummyResolver:
+        SEARCH_RESULTS_URL = "https://mjl.clarivate.com/search-results"
+
+        def resolve(self, journal_title=None, issn=None, eissn=None):
+            from paperinsight.web.journal_resolver import MJLJournalCandidate, MJLJournalResolution
+
+            return MJLJournalResolution(
+                status="OK",
+                match_method="issn",
+                search_value=issn,
+                candidate=MJLJournalCandidate(
+                    publication_seq_no="88888J",
+                    publication_title="NATURE PHOTONICS",
+                    publication_title_iso="Nat. Photon.",
+                    issn="1749-4885",
+                    eissn="1749-4893",
+                    publisher_name="Nature Portfolio",
+                    search_identifier="search-id-np",
+                    search_url="https://mjl.clarivate.com/search-results?issn=1749-4893",
+                    profile_url="https://mjl.clarivate.com/journal-profile",
+                ),
+            )
+
+    class DummyFetcher:
+        def lookup(self, candidate):
+            from paperinsight.web.impact_factor_fetcher import ImpactFactorLookupResult
+
+            return ImpactFactorLookupResult(
+                status="ERROR",
+                source_name="MJL_PROFILE_API",
+                source_url="https://mjl.clarivate.com/api/mjl/jprof/restricted/seqno/88888J",
+                error_message="HTTP 500",
+            )
+
+        def lookup_by_title(self, journal_title):
+            from paperinsight.web.impact_factor_fetcher import ImpactFactorLookupResult
+
+            return ImpactFactorLookupResult(
+                status="OK_STALE",
+                source_name="CURATED_FALLBACK",
+                source_url="https://example.test/fallback",
+                impact_factor=32.1,
+                year=2024,
+            )
+
+    pipeline.journal_resolver = DummyResolver()
+    pipeline.if_fetcher = DummyFetcher()
+    pipeline.letpub_if_fetcher = None
+    pipeline.search_crawler_fetcher = None
+    pipeline.wos_if_fetcher = None
+    paper_data = PaperData(
+        paper_info=PaperInfo(
+            journal_name="Nature Photonics",
+            raw_journal_title="Nature Photonics",
+            raw_issn="1749-4885",
+        )
+    )
+
+    resolution = pipeline._resolve_journal_metadata(paper_data)
+    pipeline._supplement_impact_factor(paper_data, resolution)
+
+    # When official returns ERROR, secondary (fallback) should be used
+    assert paper_data.paper_info.impact_factor == 32.1
+    assert paper_data.paper_info.impact_factor_year == 2024
+    assert "CURATED_FALLBACK" in (paper_data.paper_info.impact_factor_source or "")
+    assert "OK" in (paper_data.paper_info.impact_factor_status or "")
 
 
 def test_cli_prompts_for_bilingual_choice_each_run(monkeypatch, tmp_path):
@@ -343,6 +738,7 @@ def test_cli_prompts_for_bilingual_choice_each_run(monkeypatch, tmp_path):
     monkeypatch.setattr("paperinsight.cli._select_mode", lambda config, mode_arg=None: "api")
 
     answers = iter([True, True])
+    monkeypatch.setattr("paperinsight.cli._is_interactive", lambda: True)
     monkeypatch.setattr("paperinsight.cli.Confirm.ask", lambda *args, **kwargs: next(answers))
 
     class DummyPipeline:

@@ -314,6 +314,7 @@ class PaperData(BaseModel):
             "CIE": "\n".join(cies) if cies else None,
             "寿命": "\n".join(lifetimes) if lifetimes else None,
             "最高EQE": self.paper_info.best_eqe,
+            "优化层级": self.optimization.level if self.optimization else None,
             "优化策略": self.paper_info.optimization_strategy,
             "优化详情": self.optimization.strategy if self.optimization else None,
             "关键发现": self.optimization.key_findings if self.optimization else None,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
@@ -13,6 +14,10 @@ from paperinsight.utils.journal_metadata import (
     normalize_exact_journal_title,
     normalize_issn,
 )
+from paperinsight.web.journal_if_database import JOURNAL_ALIASES
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -86,7 +91,8 @@ class MJLJournalResolver:
         issn: Optional[str] = None,
         eissn: Optional[str] = None,
     ) -> MJLJournalResolution:
-        match_keys = build_journal_match_keys(journal_title, issn=issn, eissn=eissn)
+        resolved_title = self._resolve_alias(journal_title) if journal_title else None
+        match_keys = build_journal_match_keys(resolved_title or journal_title, issn=issn, eissn=eissn)
         search_cache: dict[str, list[MJLJournalCandidate]] = {}
 
         for match_method, match_value in match_keys.prioritized_items():
@@ -98,13 +104,9 @@ class MJLJournalResolver:
                 if search_value not in search_cache:
                     search_cache[search_value] = self.search_journals(search_value)
                 candidates = search_cache[search_value]
-            except Exception as exc:  # pragma: no cover - defensive fallback
-                return MJLJournalResolution(
-                    status="ERROR",
-                    match_method=match_method,
-                    search_value=search_value,
-                    error_message=str(exc),
-                )
+            except Exception as exc:
+                logger.warning(f"MJL search failed for {search_value}: {exc}")
+                continue
 
             filtered = self._filter_candidates(candidates, match_method, match_value)
             if len(filtered) == 1:
@@ -128,6 +130,27 @@ class MJLJournalResolver:
             match_method=None,
             search_value=match_keys.issn or match_keys.eissn or match_keys.exact_title,
         )
+
+    def _resolve_alias(self, journal_title: str) -> str:
+        """解析期刊名称别名"""
+        if not journal_title:
+            return journal_title
+
+        normalized = canonicalize_journal_title(journal_title)
+        if not normalized:
+            return journal_title
+
+        if normalized in JOURNAL_ALIASES:
+            resolved = JOURNAL_ALIASES[normalized]
+            logger.info(f"Resolved alias '{journal_title}' -> '{resolved}'")
+            return resolved
+
+        for alias_key, canonical in JOURNAL_ALIASES.items():
+            if alias_key in normalized or normalized in alias_key:
+                logger.info(f"Resolved fuzzy alias '{journal_title}' -> '{canonical}'")
+                return canonical
+
+        return journal_title
 
     def search_journals(self, search_value: str) -> list[MJLJournalCandidate]:
         payload = self._build_search_payload(search_value)

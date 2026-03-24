@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Optional
 from urllib.parse import urlencode
 
@@ -24,6 +25,15 @@ class ImpactFactorLookupResult:
 class MJLImpactFactorFetcher:
     PROFILE_API_URL = "https://mjl.clarivate.com/api/mjl/jprof/restricted/seqno/{seqno}"
     JCR_DEEP_LINK_URL = "https://mjl.clarivate.com/api/censub/restricted/jcr-deep-link/{seqno}"
+
+    # CURATED_FALLBACK 年份超过此阈值（年）则标记为 STALE
+    STALE_YEAR_THRESHOLD = 2
+
+    @staticmethod
+    def _current_jcr_year() -> int:
+        """当前 JCR 年份：当年 6 月前取上一年，6 月后取当年。"""
+        now = datetime.now()
+        return now.year - 1 if now.month < 6 else now.year
 
     def __init__(
         self,
@@ -158,8 +168,11 @@ class MJLImpactFactorFetcher:
             )
 
         impact_factor, year, source_url = fallback
+        status = "OK"
+        if year is not None and self._current_jcr_year() - year > self.STALE_YEAR_THRESHOLD:
+            status = "OK_STALE"
         return ImpactFactorLookupResult(
-            status="OK",
+            status=status,
             source_name="CURATED_FALLBACK",
             source_url=source_url,
             impact_factor=impact_factor,
@@ -206,8 +219,11 @@ class MJLImpactFactorFetcher:
             )
 
         impact_factor, year, source_url = fallback
+        status = "OK"
+        if year is not None and self._current_jcr_year() - year > self.STALE_YEAR_THRESHOLD:
+            status = "OK_STALE"
         return ImpactFactorLookupResult(
-            status="OK",
+            status=status,
             source_name="CURATED_FALLBACK",
             source_url=source_url,
             impact_factor=impact_factor,

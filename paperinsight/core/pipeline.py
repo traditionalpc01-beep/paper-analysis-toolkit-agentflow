@@ -129,12 +129,17 @@ class AnalysisPipeline:
         self.ai_model_if_fetcher = None
         if web_enabled and ai_model_config.get("enabled", False):
             try:
-                from paperinsight.web.ai_model_if_fetcher import AIModelImpactFactorFetcher
-                self.ai_model_if_fetcher = AIModelImpactFactorFetcher(
+                from paperinsight.web.optimized_if_fetcher import OptimizedImpactFactorFetcher
+                self.ai_model_if_fetcher = OptimizedImpactFactorFetcher(
                     timeout=int(ai_model_config.get("timeout", 30)),
+                    max_workers=int(ai_model_config.get("max_workers", 3)),
+                    max_retries=int(ai_model_config.get("max_retries", 3)),
+                    cache_expiry_days=int(ai_model_config.get("cache_expiry_days", 30)),
                     qianwen_api_key=ai_model_config.get("qianwen_api_key"),
                     kimi_api_key=ai_model_config.get("kimi_api_key"),
+                    enable_cache=bool(ai_model_config.get("enable_cache", True)),
                 )
+                self.logger.info(f"[AI-IF] Initialized OptimizedImpactFactorFetcher with cache")
             except Exception as e:
                 self.logger.warning(f"[AI-IF] initializer failed: {e}")
 
@@ -468,8 +473,8 @@ class AnalysisPipeline:
             if len(exact_matches) == 1:
                 return exact_matches[0]
             if exact_matches:
-                return exact_matches[0]
-        return resolution.candidates[0]
+                return None
+        return None
 
     def _supplement_impact_factor(
         self,
@@ -499,6 +504,11 @@ class AnalysisPipeline:
                 if resolution is not None:
                     candidate = self._select_journal_candidate(resolution, journal_name)
 
+            if resolution is not None and resolution.status == "MULTI_MATCH" and candidate is None:
+                paper_info.impact_factor_source = "MJL_RESOLVER"
+                paper_info.impact_factor_status = resolution.status
+                return
+
             letpub_journal_name = (
                 candidate.display_title if candidate and candidate.display_title else None
             ) or journal_name
@@ -510,11 +520,45 @@ class AnalysisPipeline:
                     issn=paper_info.matched_issn or paper_info.raw_issn,
                     eissn=paper_info.raw_eissn,
                 )
-            secondary_results = self._lookup_secondary_impact_factor_results(
+
+            official_result = self._lookup_official_impact_factor_result(
                 paper_info=paper_info,
                 candidate=candidate,
                 fetch_official_impact_factor=fetch_official_impact_factor,
             )
+            secondary_results = self._lookup_secondary_impact_factor_results(
+                paper_info=paper_info,
+            )
+
+            if official_result and official_result.status == "OK" and official_result.impact_factor is not None:
+                validators = [
+                    result
+                    for result in [letpub_result, *secondary_results]
+                    if result is not None
+                    and getattr(result, "status", None) == "OK"
+                    and getattr(result, "impact_factor", None) is not None
+                    and abs(result.impact_factor - official_result.impact_factor) <= validation_tolerance
+                ]
+                selected_result = self._merge_impact_factor_results(
+                    primary=official_result,
+                    validators=validators,
+                    status="OK_VALIDATED" if validators else "OK",
+                )
+                if self._apply_impact_factor_result(
+                    paper_info,
+                    selected_result,
+                    current_if=current_if,
+                    should_correct_existing=should_correct_existing,
+                ):
+                    self.logger.info(
+                        f"[IFLookup] selected IF={selected_result.impact_factor}, source={selected_result.source_name}"
+                    )
+                    return
+
+            if official_result and official_result.status == "NO_ACCESS":
+                self._apply_impact_factor_status(paper_info, official_result)
+                self.logger.info("[IFLookup] official IF unavailable due to NO_ACCESS")
+                return
 
             selected_result = self._select_validated_impact_factor_result(
                 letpub_result=letpub_result,
@@ -561,6 +605,8 @@ class AnalysisPipeline:
 
             resolution = resolution or self._resolve_journal_metadata(paper_data)
             if resolution is None:
+                if official_result is not None:
+                    self._apply_impact_factor_status(paper_info, official_result)
                 return
 
             candidate = candidate or self._select_journal_candidate(resolution, journal_name)
@@ -573,33 +619,41 @@ class AnalysisPipeline:
             if not fetch_official_impact_factor:
                 return
 
-            fetch_result = self._select_best_secondary_result(secondary_results)
-            if fetch_result is None:
+            if official_result is not None:
+                self._apply_impact_factor_status(paper_info, official_result)
                 return
-            self._apply_impact_factor_result(
-                paper_info,
-                fetch_result,
-                current_if=current_if,
-                should_correct_existing=should_correct_existing,
-            )
         except Exception as e:
             self.logger.warning(f"[IFLookup] failed: {e}")
 
-    def _lookup_secondary_impact_factor_results(
+    def _lookup_official_impact_factor_result(
         self,
         *,
         paper_info,
         candidate,
         fetch_official_impact_factor: bool,
+    ) -> Optional[ImpactFactorLookupResult]:
+        if not fetch_official_impact_factor or self.if_fetcher is None or candidate is None:
+            return None
+
+        try:
+            return self.if_fetcher.lookup(candidate)
+        except Exception as e:
+            self.logger.warning(f"[IFLookup] MJL lookup failed: {e}")
+            return ImpactFactorLookupResult(
+                status="ERROR",
+                source_name="MJL_PROFILE_API",
+                source_url=paper_info.journal_profile_url or "",
+                error_message=str(e),
+            )
+
+    def _lookup_secondary_impact_factor_results(
+        self,
+        *,
+        paper_info,
     ) -> List[ImpactFactorLookupResult]:
         results: List[ImpactFactorLookupResult] = []
 
-        if fetch_official_impact_factor and self.if_fetcher is not None:
-            if candidate is not None:
-                try:
-                    results.append(self.if_fetcher.lookup(candidate))
-                except Exception as e:
-                    self.logger.warning(f"[IFLookup] MJL lookup failed: {e}")
+        if self.if_fetcher is not None:
             try:
                 results.append(
                     self.if_fetcher.lookup_by_title(paper_info.journal_name or paper_info.raw_journal_title)
@@ -643,7 +697,8 @@ class AnalysisPipeline:
         valid_secondaries = [
             result
             for result in secondary_results
-            if getattr(result, "status", None) == "OK" and getattr(result, "impact_factor", None) is not None
+            if getattr(result, "status", None) in {"OK", "OK_STALE"}
+            and getattr(result, "impact_factor", None) is not None
         ]
 
         if letpub_result and letpub_result.status == "OK" and letpub_result.impact_factor is not None:
@@ -753,7 +808,8 @@ class AnalysisPipeline:
         valid_results = [
             result
             for result in results
-            if getattr(result, "status", None) == "OK" and getattr(result, "impact_factor", None) is not None
+            if getattr(result, "status", None) in {"OK", "OK_STALE"}
+            and getattr(result, "impact_factor", None) is not None
         ]
         if not valid_results:
             return None
@@ -762,8 +818,8 @@ class AnalysisPipeline:
     @staticmethod
     def _impact_factor_result_sort_key(result: ImpactFactorLookupResult) -> tuple[int, int, float]:
         return (
-            AnalysisPipeline._impact_factor_source_priority(result.source_name),
             -(result.year or 0),
+            AnalysisPipeline._impact_factor_source_priority(result.source_name),
             -(result.impact_factor or 0.0),
         )
 
@@ -776,7 +832,10 @@ class AnalysisPipeline:
             "SEARCH_CRAWLER": 3,
             "LETPUB": 4,
         }
-        return priorities.get(source_name or "", 9)
+        source_tokens = [token for token in (source_name or "").split("+") if token]
+        if not source_tokens:
+            return 9
+        return min(priorities.get(token, 9) for token in source_tokens)
 
     @staticmethod
     def _is_authoritative_if_source(source_name: Optional[str]) -> bool:
@@ -830,10 +889,32 @@ class AnalysisPipeline:
             paper_info.impact_factor = impact_factor
             return True
 
-        if should_correct_existing and abs(current_if - impact_factor) >= 0.5:
+        source_tokens = set((new_source_name or "").split("+"))
+        if should_correct_existing and "MJL_PROFILE_API" in source_tokens and abs(current_if - impact_factor) > 1e-6:
+            paper_info.impact_factor = impact_factor
+        elif should_correct_existing and abs(current_if - impact_factor) >= 0.5:
             paper_info.impact_factor = impact_factor
 
         return True
+
+    @staticmethod
+    def _apply_impact_factor_status(paper_info, fetch_result: Any) -> None:
+        source_url = getattr(fetch_result, "source_url", None)
+        if source_url:
+            paper_info.journal_profile_url = source_url
+
+        source_name = getattr(fetch_result, "source_name", None)
+        if source_name:
+            paper_info.impact_factor_source = source_name
+
+        status = getattr(fetch_result, "status", None)
+        if status:
+            paper_info.impact_factor_status = status
+
+        paper_info.impact_factor_year = getattr(fetch_result, "year", None)
+
+        if status == "NO_ACCESS":
+            paper_info.impact_factor = None
 
     @staticmethod
     def _should_try_secondary_if_sources(fetch_result: Any) -> bool:
@@ -1106,6 +1187,9 @@ class AnalysisPipeline:
                 "标题": "",
                 "期刊": "",
                 "影响因子": "",
+                "影响因子年份": "",
+                "影响因子来源": "",
+                "影响因子状态": "",
                 "作者": "",
                 "器件结构": "",
                 "EQE": "",
@@ -1189,12 +1273,24 @@ class AnalysisPipeline:
             if not best_device or not best_device.structure:
                 missing.append("structure")
 
-        if not missing:
-            return "Completed: core fields are available"
+        warnings = []
+        if_status = str(info.impact_factor_status or "")
+        if "STALE" in if_status:
+            year_display = info.impact_factor_year or "?"
+            warnings.append(f"IF year {year_display} may be outdated")
 
-        if len(missing) >= 4:
-            return "Partial extraction: missing " + ", ".join(missing[:5])
-        return "Completed with gaps: " + ", ".join(missing)
+        parts = []
+        if not missing:
+            parts.append("Completed: core fields are available")
+        elif len(missing) >= 4:
+            parts.append("Partial extraction: missing " + ", ".join(missing[:5]))
+        else:
+            parts.append("Completed with gaps: " + ", ".join(missing))
+
+        if warnings:
+            parts.append("Warnings: " + "; ".join(warnings))
+
+        return " | ".join(parts)
 
     @staticmethod
     def _build_error_summary(error: Dict[str, Any]) -> str:

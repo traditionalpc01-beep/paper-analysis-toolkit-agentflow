@@ -83,6 +83,51 @@
   - `docs/QUALITY_GATES.md`
   - `tests/test_reporting_outputs.py`
 
+## AH-007 提升最终 Excel 中 IF（影响因子）字段准确性
+
+- 状态：`IN_PROGRESS`
+- 来源：本轮分析请求“提升最终 Excel 中 IF（影响因子）字段准确性”
+- 目标：梳理从期刊解析、IF 抓取、来源选择到 Excel 导出的整条链路，降低最终报表中 IF 数值、来源语义和状态语义不一致的风险
+- 待分析范围：
+  - `docs/impact_factor_rules.md`
+  - `paperinsight/core/pipeline.py`
+  - `paperinsight/web/journal_resolver.py`
+  - `paperinsight/web/impact_factor_fetcher.py`
+  - `paperinsight/core/reporter.py`
+  - `tests/test_impact_factor_fetcher.py`
+  - `tests/test_v31_features.py`
+  - `tests/test_reporting_outputs.py`
+- 预期产物：
+  - 当前 IF 生成链路说明
+  - Excel 中 IF 不准确的可能原因清单
+  - 可逐步关闭的子任务拆分
+- 本阶段已完成：
+  - [x] 梳理 IF 生成链路并登记 issue
+  - [x] 修正 pipeline 中“官方结果被次级来源抢占”的主路径
+  - [x] 修正 `NO_ACCESS` 场景下状态优先落表，而不是自动写入公开回退值
+  - [x] 让最终 Excel 默认导出 `impact_factor_year` / `impact_factor_source` / `impact_factor_status`
+  - [x] 补 `tests/test_v31_features.py` 与 `tests/test_reporting_outputs.py` 的契约回归
+  - [x] 明确“最终 Excel 取期刊当前可拿到的最新 IF，而不是论文发表当年的 IF”口径
+  - [x] 调整次级来源选择逻辑，官方缺席时优先保留年份更新的 IF 结果
+  - [x] 修正 `MULTI_MATCH` 场景，避免静默挑第一个候选期刊继续抓 IF
+  - [x] 补 `tests/test_impact_factor_fetcher.py` 与 `tests/test_v31_features.py` 的 latest IF / `MULTI_MATCH` 回归
+  - [x] 为 `NOT_VISIBLE` / `ERROR` 场景补端到端 pipeline 测试（`test_pipeline_falls_back_to_secondary_when_official_not_visible`, `test_pipeline_records_error_status_from_official_lookup`）
+  - [x] 为 `NO_MATCH` 场景补端到端 pipeline 测试（`test_pipeline_sets_correct_status_when_journal_no_match`）
+  - [x] 修复 `OK_STALE` 次级来源被 `_select_validated_impact_factor_result` 过滤掉的问题
+  - [x] 修复 reporter 中 `impact_factor_year` 被错误转为字符串的类型问题
+  - [x] 补充 `OK_STALE` 次级来源接受规则到 `docs/impact_factor_rules.md`
+- 下一阶段待做：
+  - [ ] 增加真实样例批量回归，核查测试 PDF 集中的 IF 来源分布与准确性
+  - [ ] 考虑在 `_apply_impact_factor_status` 中让 `NOT_VISIBLE` 和 `ERROR` 也记录状态但保留后续回退路径（当前已实现）
+- 当前已知风险：
+  - `CURATED_FALLBACK` 仍可能给出旧年份值，用户虽然能在 Excel 中看到年份和 `OK_STALE` 状态，但数值本身仍可能过期
+  - `STALE_YEAR_THRESHOLD` 固定为 2 年，未暴露为配置项；未来可考虑让用户通过配置调整
+  - pytest + Python 3.13 + Windows 存在 symlink/挂载点兼容性问题（`WinError 448`），需要在 session finish 时忽略
+- 关闭条件（预留）：
+  - 契约、实现、测试三者对齐
+  - 最终 Excel 的 IF 值、来源/状态表达与规则一致
+  - 关键回归用例补齐
+
 ## 完成本轮后的默认工作方式
 
 - 新问题先登记到这里或同类 issue 文档，再拆任务

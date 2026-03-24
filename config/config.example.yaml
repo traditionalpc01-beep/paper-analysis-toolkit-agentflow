@@ -57,8 +57,10 @@ web_search:
   ai_model_if:
     enabled: false
     timeout: 60
-    headless: true
-    delay: 2.0
+    max_workers: 3
+    max_retries: 3
+    cache_expiry_days: 30
+    enable_cache: true
     qianwen_api_key: ""
     kimi_api_key: ""
   search_crawler:
