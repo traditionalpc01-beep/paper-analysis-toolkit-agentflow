@@ -14,6 +14,11 @@ from paperinsight.utils.hash_utils import calculate_md5
 
 logger = logging.getLogger("paperinsight.cache")
 
+# 当前缓存数据 schema 版本号。
+# 当 PaperData 的 Pydantic schema 发生变更（新增/删除/重命名字段）时，
+# 应递增此版本号，使旧缓存被正确标记为过期。
+CACHE_SCHEMA_VERSION = 1
+
 
 class CacheManager:
     """缓存管理器"""
@@ -117,44 +122,56 @@ class CacheManager:
     def load_data_cache(self, md5: str) -> Optional[dict]:
         """
         加载完整数据缓存
-        
+
         Args:
             md5: MD5 哈希值
-        
+
         Returns:
-            缓存数据(如果存在)
+            缓存数据(如果存在且版本兼容)；版本不匹配时返回 None。
         """
         cache_path = self.get_data_cache_path(md5)
         if not cache_path.exists():
             return None
-        
+
         try:
             with cache_path.open("r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
         except (json.JSONDecodeError, OSError) as e:
             logger.warning(f"[Cache] broken data cache ignored: {cache_path} | {e}")
             return None
+
+        # 版本兼容性检查
+        cached_version = data.get("_cache_version", 0)
+        if cached_version != CACHE_SCHEMA_VERSION:
+            logger.info(
+                f"[Cache] schema version mismatch for {cache_path.name}: "
+                f"cached={cached_version}, current={CACHE_SCHEMA_VERSION}; re-processing"
+            )
+            return None
+
+        return data
     
     def save_data_cache(self, md5: str, data: dict) -> Path:
         """
         保存完整数据缓存
-        
+
         Args:
             md5: MD5 哈希值
             data: 要缓存的数据
-        
+
         Returns:
             缓存文件路径
         """
         cache_path = self.get_data_cache_path(md5)
-        
-        # 添加缓存时间戳
+
+        # 添加缓存元信息
         data["_cache_timestamp"] = datetime.now().isoformat()
         data["_cache_md5"] = md5
-        
+        data["_cache_version"] = CACHE_SCHEMA_VERSION
+
         with cache_path.open("w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        
+
         return cache_path
     
     def load_ocr_cache(self, md5: str) -> Optional[str]:
