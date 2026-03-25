@@ -194,7 +194,7 @@ def normalize_config(config: Optional[dict[str, Any]]) -> dict[str, Any]:
     """将旧版配置统一转换为当前嵌套结构。"""
     normalized = copy.deepcopy(DEFAULT_CONFIG)
     if not config:
-        return normalized
+        config = {}
 
     config = decrypt_sensitive_fields(copy.deepcopy(config))
 
@@ -207,6 +207,9 @@ def normalize_config(config: Optional[dict[str, Any]]) -> dict[str, Any]:
 
     # 标准化输出格式
     normalized["output"]["format"] = _normalize_output_formats(normalized["output"]["format"])
+
+    # 配置值范围校验
+    _validate_config_ranges(normalized)
 
     return normalized
 
@@ -423,3 +426,81 @@ def create_interactive_config() -> dict[str, Any]:
     返回初始配置模板，实际交互逻辑在 CLI 中实现。
     """
     return copy.deepcopy(DEFAULT_CONFIG)
+
+
+def _validate_config_ranges(config: dict[str, Any]) -> None:
+    """校验配置值范围，不合法时 warning 并回退到默认值。"""
+    _clamp_value(
+        config, "web_search", "timeout",
+        default=30, min_val=1, max_val=300,
+    )
+    _clamp_value(
+        config, "web_search", "impact_factor_validation_tolerance",
+        default=0.6, min_val=0.0, max_val=10.0,
+    )
+    _clamp_value(
+        config, "llm", "timeout",
+        default=120, min_val=1, max_val=600,
+    )
+    _clamp_value(
+        config, "llm", "max_retries",
+        default=3, min_val=0, max_val=10,
+    )
+    _clamp_value(
+        config, "cleaner", "max_input_chars",
+        default=24000, min_val=100, max_val=100000,
+    )
+    _clamp_value(
+        config, "cleaner", "max_blocks",
+        default=80, min_val=1, max_val=200,
+    )
+    _clamp_value(
+        config, "cleaner", "min_block_score",
+        default=3.0, min_val=0.0, max_val=10.0,
+    )
+    _clamp_value(
+        config, "pdf", "max_pages",
+        default=0, min_val=0, max_val=500,
+    )
+    _clamp_value(
+        config, "pdf", "text_ratio_threshold",
+        default=0.1, min_val=0.0, max_val=1.0,
+    )
+
+
+def _clamp_value(
+    config: dict[str, Any],
+    section: str,
+    key: str,
+    *,
+    default: Any,
+    min_val: Any,
+    max_val: Any,
+) -> None:
+    """校验并修正配置值到合法范围。"""
+    import logging
+    logger = logging.getLogger("paperinsight.config")
+
+    section_cfg = config.get(section, {})
+    value = section_cfg.get(key, default)
+
+    try:
+        num_value = float(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            f"[Config] {section}.{key}={value!r} is not a number, falling back to {default}"
+        )
+        config.setdefault(section, {})[key] = default
+        return
+
+    if num_value < float(min_val) or num_value > float(max_val):
+        logger.warning(
+            f"[Config] {section}.{key}={num_value} out of range [{min_val}, {max_val}], "
+            f"falling back to {default}"
+        )
+        config.setdefault(section, {})[key] = default
+        return
+
+    # 确保整数配置保持整数类型
+    if isinstance(default, int) and num_value == int(num_value):
+        config.setdefault(section, {})[key] = int(num_value)

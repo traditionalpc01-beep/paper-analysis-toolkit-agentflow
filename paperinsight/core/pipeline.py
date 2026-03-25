@@ -23,6 +23,7 @@ from tqdm import tqdm
 
 from paperinsight.core.cache import CacheManager
 from paperinsight.core.extractor import DataExtractor
+from paperinsight.core.if_strategy import IFRequestContext, IFSourceFactory
 from paperinsight.core.reporter import ReportGenerator
 from paperinsight.models.schemas import PaperData, ExtractionResult
 from paperinsight.parser.mineru import MinerUParser
@@ -32,12 +33,19 @@ from paperinsight.utils.hash_utils import calculate_md5
 from paperinsight.utils.file_renamer import FileRenamer
 from paperinsight.utils.logger import ErrorLogger, setup_logger
 from paperinsight.utils.pdf_utils import extract_text_with_fallback
-from paperinsight.web.impact_factor_fetcher import ImpactFactorLookupResult, MJLImpactFactorFetcher
-from paperinsight.web.journal_resolver import MJLJournalResolution, MJLJournalResolver
-from paperinsight.web.letpub_fetcher import LetPubImpactFactorFetcher
-from paperinsight.web.search_crawler_fetcher import SearchCrawlerFetcher
-from paperinsight.web.wos_journal_fetcher import WOSJournalFetcher
+from paperinsight.web.impact_factor_fetcher import ImpactFactorLookupResult
+from paperinsight.web.journal_resolver import MJLJournalResolution
 from paperinsight.utils.journal_metadata import canonicalize_journal_title
+from paperinsight.exceptions import (
+    PaperInsightError,
+    ParseError,
+    ExtractionError,
+    IFLookupError,
+    IFSourceError,
+    NetworkError,
+    CacheVersionError,
+    is_recoverable,
+)
 
 
 class AnalysisPipeline:
@@ -52,6 +60,7 @@ class AnalysisPipeline:
         output_dir: Union[str, Path],
         config: Optional[Dict[str, Any]] = None,
         cache_dir: Union[str, Path] = ".cache",
+        fetchers: Optional[Any] = None,
     ):
         """
         初始化分析管线
@@ -60,6 +69,8 @@ class AnalysisPipeline:
             output_dir: 输出目录
             config: 完整配置字典（包含 mineru, llm, cleaner 等配置）
             cache_dir: 缓存目录
+            fetchers: 可选的 WebFetchers 实例（依赖注入）。
+                      如果为 None，则从 config 自动创建。
         """
         self.config = config or {}
         self.output_dir = Path(output_dir)
@@ -83,71 +94,51 @@ class AnalysisPipeline:
         # 初始化数据提取器
         self.extractor = DataExtractor(config=self.config)
 
-        # 初始化 Web 检索器
-        web_config = self.config.get("web_search", {})
-        timeout = int(web_config.get("timeout", 30))
-        web_enabled = bool(web_config.get("enabled", True))
-        self.journal_resolver = (
-            MJLJournalResolver(timeout=timeout)
-            if web_config.get("resolve_journal_metadata", True)
-            else None
-        )
-        self.if_fetcher = (
-            MJLImpactFactorFetcher(timeout=timeout)
-            if web_config.get("fetch_official_impact_factor", True)
-            else None
-        )
-        letpub_config = web_config.get("letpub", {})
-        self.letpub_if_fetcher = (
-            LetPubImpactFactorFetcher(timeout=int(letpub_config.get("timeout", timeout)))
-            if letpub_config.get("enabled", True)
-            else None
-        )
-        crawler_config = web_config.get("search_crawler", {})
-        self.search_crawler_fetcher = (
-            SearchCrawlerFetcher(
-                timeout=timeout,
-                market=str(crawler_config.get("market", "en-US")),
-            )
-            if crawler_config.get("enabled", True)
-            else None
-        )
-        wos_config = web_config.get("web_of_science", {})
-        wos_api_key = str(wos_config.get("api_key", "")).strip()
-        self.wos_if_fetcher = (
-            WOSJournalFetcher(
-                api_key=wos_api_key,
-                timeout=timeout,
-                base_url=wos_config.get("journals_api_url"),
-            )
-            if wos_config.get("enabled") and wos_api_key
-            else None
-        )
-        
-        # 初始化 AI 模型影响因子获取器（新方式）
-        ai_model_config = web_config.get("ai_model_if", {})
-        self.ai_model_if_fetcher = None
-        if web_enabled and ai_model_config.get("enabled", False):
-            try:
-                from paperinsight.web.optimized_if_fetcher import OptimizedImpactFactorFetcher
-                self.ai_model_if_fetcher = OptimizedImpactFactorFetcher(
-                    timeout=int(ai_model_config.get("timeout", 30)),
-                    max_workers=int(ai_model_config.get("max_workers", 3)),
-                    max_retries=int(ai_model_config.get("max_retries", 3)),
-                    cache_expiry_days=int(ai_model_config.get("cache_expiry_days", 30)),
-                    qianwen_api_key=ai_model_config.get("qianwen_api_key"),
-                    kimi_api_key=ai_model_config.get("kimi_api_key"),
-                    enable_cache=bool(ai_model_config.get("enable_cache", True)),
-                )
-                self.logger.info(f"[AI-IF] Initialized OptimizedImpactFactorFetcher with cache")
-            except Exception as e:
-                self.logger.warning(f"[AI-IF] initializer failed: {e}")
+        # 初始化 Web 检索器（支持依赖注入）
+        if fetchers is not None:
+            self.journal_resolver = fetchers.journal_resolver
+            self.if_fetcher = fetchers.if_fetcher
+            self.letpub_if_fetcher = fetchers.letpub_if_fetcher
+            self.search_crawler_fetcher = fetchers.search_crawler_fetcher
+            self.wos_if_fetcher = fetchers.wos_if_fetcher
+            self.ai_model_if_fetcher = fetchers.ai_model_if_fetcher
+        else:
+            from paperinsight.core.web_fetcher_factory import WebFetcherFactory
+
+            web_config = self.config.get("web_search", {})
+            f = WebFetcherFactory.build(web_config)
+            self.journal_resolver = f.journal_resolver
+            self.if_fetcher = f.if_fetcher
+            self.letpub_if_fetcher = f.letpub_if_fetcher
+            self.search_crawler_fetcher = f.search_crawler_fetcher
+            self.wos_if_fetcher = f.wos_if_fetcher
+            self.ai_model_if_fetcher = f.ai_model_if_fetcher
 
         # 初始化报告生成器
         self.reporter = ReportGenerator(self.output_dir)
 
         # 初始化错误日志记录器
         self.error_logger = ErrorLogger(self.output_dir)
+
+        # 构建 IF 策略链
+        self._if_strategy_chain = IFSourceFactory.build_chain(
+            if_fetcher=self.if_fetcher,
+            letpub_if_fetcher=self.letpub_if_fetcher,
+            search_crawler_fetcher=self.search_crawler_fetcher,
+            wos_if_fetcher=self.wos_if_fetcher,
+            ai_model_if_fetcher=self.ai_model_if_fetcher,
+            web_config=web_config,
+        )
+        self._has_any_if_fetcher = IFSourceFactory.has_any_fetcher(
+            if_fetcher=self.if_fetcher,
+            letpub_if_fetcher=self.letpub_if_fetcher,
+            search_crawler_fetcher=self.search_crawler_fetcher,
+            wos_if_fetcher=self.wos_if_fetcher,
+            ai_model_if_fetcher=self.ai_model_if_fetcher,
+        )
+
+        # 性能计时器（各阶段累计耗时，秒）
+        self._timing: Dict[str, float] = {}
 
     def _init_parser(self) -> Optional[MinerUParser]:
         """初始化文档解析器"""
@@ -164,7 +155,7 @@ class AnalysisPipeline:
             else:
                 self.logger.warning("[Parser] MinerU unavailable; falling back to basic PDF parsing")
                 return None
-        except Exception as e:
+        except ParseError as e:
             self.logger.warning(f"[Parser] MinerU initialization failed: {e}")
             return None
 
@@ -205,10 +196,12 @@ class AnalysisPipeline:
                     paper_data = PaperData(**cached_result)
                     return paper_data, None
                 except Exception:
-                    pass  # 缓存数据格式不兼容，重新处理
+                    self.logger.info(f"[Cache] cache data incompatible for {pdf_name}, re-processing")
 
         # Step 2: PDF 解析
+        parse_stage_time = time.time()
         parse_result = self._parse_pdf(pdf_path, md5, use_cache)
+        self._timing["parsing"] = self._timing.get("parsing", 0) + (time.time() - parse_stage_time)
 
         if not parse_result.success:
             return None, self._build_error_info(
@@ -238,12 +231,16 @@ class AnalysisPipeline:
         """对解析后的 Markdown 执行清洗、提取、校验与缓存。"""
         pdf_name = pdf_path.name
         start_time = start_time or time.time()
+        timing = self._timing
+        stage_time = time.time()
 
         self.logger.info(
             f"[Debug] markdown length: {len(parse_result.markdown) if parse_result.markdown else 0}"
         )
         cleaned_content = self.cleaner.clean(parse_result.markdown)
         extraction_text = cleaned_content.get_text_for_extraction()
+        timing["cleaning"] = timing.get("cleaning", 0) + (time.time() - stage_time)
+        stage_time = time.time()
         self.logger.info(
             f"[Debug] extraction text length after cleaning: {len(extraction_text) if extraction_text else 0}"
         )
@@ -256,6 +253,7 @@ class AnalysisPipeline:
         )
 
         if not extraction_text.strip():
+            timing["cleaning"] = timing.get("cleaning", 0) + (time.time() - stage_time)
             return None, self._build_error_info(
                 pdf_name,
                 "NoContentAfterCleaning",
@@ -269,6 +267,8 @@ class AnalysisPipeline:
             cleaned_text=extraction_text,
             parse_result=parse_result,
         )
+        timing["extraction"] = timing.get("extraction", 0) + (time.time() - stage_time)
+        stage_time = time.time()
 
         if not extraction_result.success or not extraction_result.data:
             return None, self._build_error_info(
@@ -282,16 +282,10 @@ class AnalysisPipeline:
         paper_data = extraction_result.data
 
         journal_resolution = self._resolve_journal_metadata(paper_data)
-        if any(
-            [
-                self.letpub_if_fetcher,
-                self.if_fetcher,
-                self.ai_model_if_fetcher,
-                self.search_crawler_fetcher,
-                self.wos_if_fetcher,
-            ]
-        ):
+        if self._has_any_if_fetcher:
             self._supplement_impact_factor(paper_data, journal_resolution)
+        timing["if_supplement"] = timing.get("if_supplement", 0) + (time.time() - stage_time)
+        stage_time = time.time()
         if self._needs_lite_backfill(paper_data):
             self.logger.info(
                 f"[LLM] lite backfill triggered: {pdf_name} | missing={','.join(self._collect_missing_core_fields(paper_data))}"
@@ -312,12 +306,20 @@ class AnalysisPipeline:
                 ]
             ):
                 self._supplement_impact_factor(paper_data, journal_resolution)
+        timing["if_supplement"] = timing.get("if_supplement", 0) + (time.time() - stage_time)
+        stage_time = time.time()
 
         if self.enable_cache and use_cache:
             self.cache_manager.save_data_cache(md5, paper_data.model_dump())
 
+        timing["cache_save"] = timing.get("cache_save", 0) + (time.time() - stage_time)
         processing_time = time.time() - start_time
-        self.logger.info(f"[Done] {pdf_name} ({processing_time:.1f}s)")
+        self.logger.info(
+            f"[Done] {pdf_name} ({processing_time:.1f}s) "
+            f"[clean={timing.get('cleaning', 0):.1f}s "
+            f"extract={timing.get('extraction', 0):.1f}s "
+            f"if={timing.get('if_supplement', 0):.1f}s]"
+        )
 
         return paper_data, None
 
@@ -378,7 +380,7 @@ class AnalysisPipeline:
                         self.cache_manager.save_markdown_cache(md5, result.markdown)
                     return result
             except Exception as e:
-                self.logger.warning(f"[MinerU] parse failed: {e}; falling back to basic parsing")
+                self.logger.error(f"[MinerU] parse failed: {e}; falling back to basic parsing", exc_info=True)
 
         # 回退到基础 PDF 解析
         text_ratio_threshold = self.config.get("pdf", {}).get("text_ratio_threshold", 0.1)
@@ -415,7 +417,7 @@ class AnalysisPipeline:
                 eissn=raw_eissn,
             )
         except Exception as e:
-            self.logger.warning(f"[JournalResolve] failed: {e}")
+            self.logger.error(f"[JournalResolve] failed: {e}", exc_info=True)
             return None
 
         if raw_journal_title and not paper_info.raw_journal_title:
@@ -481,22 +483,27 @@ class AnalysisPipeline:
         paper_data: PaperData,
         journal_resolution: Optional[MJLJournalResolution] = None,
     ) -> None:
-        """补全影响因子。"""
+        """补全影响因子（v3.2 策略链重构）。
+
+        使用 IFSourceFactory 构建策略链，按优先级调用各 IF 来源，
+        并通过交叉验证选择最佳结果。
+        """
         paper_info = paper_data.paper_info
         journal_name = paper_info.journal_name or paper_info.raw_journal_title
         paper_title = paper_info.title
-        
+
         try:
             current_if = paper_info.impact_factor
             web_config = self.config.get("web_search", {})
             should_correct_existing = bool(web_config.get("correct_existing_impact_factor", True))
             fetch_official_impact_factor = bool(web_config.get("fetch_official_impact_factor", True))
-            use_ai_model_if = bool(web_config.get("use_ai_model_if", False))
             validation_tolerance = float(web_config.get("impact_factor_validation_tolerance", 0.6))
 
+            # 已有有效 IF 且不需要修正时跳过
             if current_if and not should_correct_existing and 0.1 <= current_if <= 200 and not fetch_official_impact_factor:
                 return
 
+            # 期刊解析
             resolution = journal_resolution
             candidate = None
             if any((journal_name, paper_info.raw_issn, paper_info.raw_eissn)):
@@ -509,66 +516,50 @@ class AnalysisPipeline:
                 paper_info.impact_factor_status = resolution.status
                 return
 
-            letpub_journal_name = (
-                candidate.display_title if candidate and candidate.display_title else None
-            ) or journal_name
+            # NO_MATCH resolution: 设置状态并返回
+            if resolution is not None and resolution.status == "NO_MATCH":
+                paper_info.impact_factor_source = "MJL_RESOLVER"
+                paper_info.impact_factor_status = "NO_MATCH"
+                return
 
-            letpub_result = None
-            if self.letpub_if_fetcher and any((letpub_journal_name, paper_info.raw_issn, paper_info.raw_eissn)):
-                letpub_result = self.letpub_if_fetcher.lookup(
-                    journal_title=letpub_journal_name,
-                    issn=paper_info.matched_issn or paper_info.raw_issn,
-                    eissn=paper_info.raw_eissn,
-                )
-
-            official_result = self._lookup_official_impact_factor_result(
+            # 构建请求上下文
+            ctx = IFRequestContext(
                 paper_info=paper_info,
-                candidate=candidate,
-                fetch_official_impact_factor=fetch_official_impact_factor,
-            )
-            secondary_results = self._lookup_secondary_impact_factor_results(
-                paper_info=paper_info,
+                journal_name=journal_name,
+                paper_title=paper_title,
+                journal_resolution=resolution,
+                journal_candidate=candidate,
+                current_if=current_if,
+                should_correct_existing=should_correct_existing,
+                validation_tolerance=validation_tolerance,
             )
 
-            if official_result and official_result.status == "OK" and official_result.impact_factor is not None:
-                validators = [
-                    result
-                    for result in [letpub_result, *secondary_results]
-                    if result is not None
-                    and getattr(result, "status", None) == "OK"
-                    and getattr(result, "impact_factor", None) is not None
-                    and abs(result.impact_factor - official_result.impact_factor) <= validation_tolerance
-                ]
-                selected_result = self._merge_impact_factor_results(
-                    primary=official_result,
-                    validators=validators,
-                    status="OK_VALIDATED" if validators else "OK",
-                )
-                if self._apply_impact_factor_result(
-                    paper_info,
-                    selected_result,
-                    current_if=current_if,
-                    should_correct_existing=should_correct_existing,
-                ):
-                    self.logger.info(
-                        f"[IFLookup] selected IF={selected_result.impact_factor}, source={selected_result.source_name}"
-                    )
-                    return
+            # 通过策略链收集各来源结果
+            official_result = self._collect_official_if(ctx, fetch_official_impact_factor)
+            secondary_results = self._collect_secondary_ifs(ctx)
+            letpub_result = self._collect_letpub_if(ctx)
 
+            # 尝试从官方结果中获取有效 IF
+            if self._try_apply_official_result(
+                paper_info, official_result, letpub_result, secondary_results,
+                current_if, should_correct_existing, validation_tolerance,
+            ):
+                return
+
+            # 官方无结果或 NO_ACCESS，尝试次级来源
             if official_result and official_result.status == "NO_ACCESS":
                 self._apply_impact_factor_status(paper_info, official_result)
                 self.logger.info("[IFLookup] official IF unavailable due to NO_ACCESS")
                 return
 
+            # 尝试从次级来源中选择验证过的结果
             selected_result = self._select_validated_impact_factor_result(
                 letpub_result=letpub_result,
                 secondary_results=secondary_results,
                 tolerance=validation_tolerance,
             )
             if selected_result and self._apply_impact_factor_result(
-                paper_info,
-                selected_result,
-                current_if=current_if,
+                paper_info, selected_result, current_if=current_if,
                 should_correct_existing=should_correct_existing,
             ):
                 self.logger.info(
@@ -576,116 +567,168 @@ class AnalysisPipeline:
                 )
                 return
 
-            # 优先使用 AI 模型方式获取影响因子（新方式）
-            if use_ai_model_if and self.ai_model_if_fetcher:
-                self.logger.info(f"[IFLookup] query via AI method: journal={journal_name}, title={paper_title[:30] if paper_title else 'N/A'}...")
-                try:
-                    # 传入期刊名称和论文标题
-                    fetch_result = self.ai_model_if_fetcher.lookup(
-                        paper_title=paper_title or "",
-                        journal_name=journal_name
-                    )
-                    if fetch_result.status == "OK" and fetch_result.impact_factor is not None:
-                        paper_info.impact_factor = fetch_result.impact_factor
-                        paper_info.impact_factor_source = fetch_result.source_name
-                        paper_info.impact_factor_status = "OK"
-                        if fetch_result.year:
-                            paper_info.impact_factor_year = fetch_result.year
-                        self.logger.info(f"[IFLookup] AI method succeeded: IF={fetch_result.impact_factor}, source={fetch_result.source_name}")
-                        return
-                    else:
-                        self.logger.warning(f"[IFLookup] AI method failed: {fetch_result.error_message}")
-                except Exception as e:
-                    self.logger.warning(f"[IFLookup] AI method exception: {e}")
-                # 新方式失败，继续尝试原有方式
-
-            # 原有方式：通过期刊元数据获取
-            if not any((journal_name, paper_info.raw_issn, paper_info.raw_eissn)):
+            # 尝试 AI 模型方式
+            ai_result = self._try_ai_model_if(ctx, web_config)
+            if ai_result and self._apply_impact_factor_result(
+                paper_info, ai_result, current_if=current_if,
+                should_correct_existing=should_correct_existing,
+            ):
                 return
 
-            resolution = resolution or self._resolve_journal_metadata(paper_data)
-            if resolution is None:
-                if official_result is not None:
-                    self._apply_impact_factor_status(paper_info, official_result)
-                return
-
-            candidate = candidate or self._select_journal_candidate(resolution, journal_name)
-
-            if not candidate:
-                paper_info.impact_factor_source = "MJL_RESOLVER"
-                paper_info.impact_factor_status = resolution.status
-                return
-
-            if not fetch_official_impact_factor:
-                return
-
+            # 最终回退：应用官方状态（如果有）
             if official_result is not None:
                 self._apply_impact_factor_status(paper_info, official_result)
-                return
-        except Exception as e:
-            self.logger.warning(f"[IFLookup] failed: {e}")
 
-    def _lookup_official_impact_factor_result(
-        self,
-        *,
-        paper_info,
-        candidate,
-        fetch_official_impact_factor: bool,
+        except Exception as e:
+            self.logger.error(f"[IFLookup] failed: {e}", exc_info=True)
+
+    def _collect_official_if(
+        self, ctx: IFRequestContext, fetch_official: bool,
     ) -> Optional[ImpactFactorLookupResult]:
-        if not fetch_official_impact_factor or self.if_fetcher is None or candidate is None:
+        """通过官方策略（MJL Profile API）获取 IF。"""
+        if not fetch_official or self.if_fetcher is None or ctx.journal_candidate is None:
             return None
-
         try:
-            return self.if_fetcher.lookup(candidate)
+            return self.if_fetcher.lookup(ctx.journal_candidate)
         except Exception as e:
-            self.logger.warning(f"[IFLookup] MJL lookup failed: {e}")
+            self.logger.error(f"[IFLookup] MJL_PROFILE_API lookup failed: {e}", exc_info=True)
             return ImpactFactorLookupResult(
                 status="ERROR",
                 source_name="MJL_PROFILE_API",
-                source_url=paper_info.journal_profile_url or "",
+                source_url=ctx.paper_info.journal_profile_url or "",
                 error_message=str(e),
             )
 
-    def _lookup_secondary_impact_factor_results(
-        self,
-        *,
-        paper_info,
-    ) -> List[ImpactFactorLookupResult]:
+    def _collect_secondary_ifs(self, ctx: IFRequestContext) -> List[ImpactFactorLookupResult]:
+        """收集所有次级来源的 IF 结果。"""
         results: List[ImpactFactorLookupResult] = []
 
+        # CuratedFallbackStrategy — 使用 if_fetcher.lookup_by_title
         if self.if_fetcher is not None:
-            try:
-                results.append(
-                    self.if_fetcher.lookup_by_title(paper_info.journal_name or paper_info.raw_journal_title)
-                )
-            except Exception as e:
-                self.logger.warning(f"[IFLookup] curated fallback lookup failed: {e}")
+            journal = ctx.paper_info.journal_name or ctx.paper_info.raw_journal_title
+            if journal:
+                try:
+                    result = self.if_fetcher.lookup_by_title(journal)
+                    if result is not None:
+                        results.append(result)
+                except Exception as e:
+                    self.logger.error(f"[IFLookup] CURATED_FALLBACK lookup failed: {e}", exc_info=True)
 
+        # SearchCrawlerStrategy
         if self.search_crawler_fetcher is not None:
-            try:
-                results.append(
-                    self.search_crawler_fetcher.lookup(
-                        journal_title=paper_info.journal_name or paper_info.raw_journal_title,
-                        issn=paper_info.matched_issn or paper_info.raw_issn,
-                        eissn=paper_info.raw_eissn,
+            journal = ctx.paper_info.journal_name or ctx.paper_info.raw_journal_title
+            if journal:
+                try:
+                    result = self.search_crawler_fetcher.lookup(
+                        journal_title=journal,
+                        issn=ctx.paper_info.matched_issn or ctx.paper_info.raw_issn,
+                        eissn=ctx.paper_info.raw_eissn,
                     )
-                )
-            except Exception as e:
-                self.logger.warning(f"[IFLookup] search crawler lookup failed: {e}")
+                    if result is not None:
+                        results.append(result)
+                except Exception as e:
+                    self.logger.error(f"[IFLookup] SEARCH_CRAWLER lookup failed: {e}", exc_info=True)
 
+        # WOS Journals
         if self.wos_if_fetcher is not None:
-            try:
-                results.append(
-                    self.wos_if_fetcher.lookup(
-                        journal_title=paper_info.journal_name or paper_info.raw_journal_title,
-                        issn=paper_info.matched_issn or paper_info.raw_issn,
-                        eissn=paper_info.raw_eissn,
+            journal = ctx.paper_info.journal_name or ctx.paper_info.raw_journal_title
+            if journal:
+                try:
+                    result = self.wos_if_fetcher.lookup(
+                        journal_title=journal,
+                        issn=ctx.paper_info.matched_issn or ctx.paper_info.raw_issn,
+                        eissn=ctx.paper_info.raw_eissn,
                     )
-                )
-            except Exception as e:
-                self.logger.warning(f"[IFLookup] WOS lookup failed: {e}")
+                    if result is not None:
+                        results.append(result)
+                except Exception as e:
+                    self.logger.error(f"[IFLookup] WOS_JOURNALS lookup failed: {e}", exc_info=True)
 
         return results
+
+    def _collect_letpub_if(self, ctx: IFRequestContext) -> Optional[ImpactFactorLookupResult]:
+        """通过 LetPub 策略获取 IF。"""
+        if self.letpub_if_fetcher is None:
+            return None
+        letpub_journal_name = (
+            ctx.journal_candidate.display_title
+            if ctx.journal_candidate and ctx.journal_candidate.display_title
+            else None
+        ) or ctx.journal_name
+        if not any((letpub_journal_name, ctx.paper_info.raw_issn, ctx.paper_info.raw_eissn)):
+            return None
+        return self.letpub_if_fetcher.lookup(
+            journal_title=letpub_journal_name,
+            issn=ctx.paper_info.matched_issn or ctx.paper_info.raw_issn,
+            eissn=ctx.paper_info.raw_eissn,
+        )
+
+    def _try_ai_model_if(
+        self, ctx: IFRequestContext, web_config: Dict[str, Any],
+    ) -> Optional[ImpactFactorLookupResult]:
+        """尝试 AI 模型方式获取 IF。"""
+        use_ai = bool(web_config.get("use_ai_model_if", False))
+        if not use_ai or self.ai_model_if_fetcher is None:
+            return None
+        logger = self.logger
+        logger.info(
+            f"[IFLookup] query via AI method: journal={ctx.journal_name}, "
+            f"title={ctx.paper_title[:30] if ctx.paper_title else 'N/A'}..."
+        )
+        try:
+            fetch_result = self.ai_model_if_fetcher.lookup(
+                paper_title=ctx.paper_title or "",
+                journal_name=ctx.journal_name,
+            )
+            if fetch_result.status == "OK" and fetch_result.impact_factor is not None:
+                logger.info(
+                    f"[IFLookup] AI method succeeded: IF={fetch_result.impact_factor}, "
+                    f"source={fetch_result.source_name}"
+                )
+                return fetch_result
+            else:
+                logger.warning(f"[IFLookup] AI method failed: {fetch_result.error_message}")
+                return None
+        except Exception as e:
+            logger.warning(f"[IFLookup] AI method error: {e}")
+            return None
+
+    def _try_apply_official_result(
+        self,
+        paper_info,
+        official_result: Optional[ImpactFactorLookupResult],
+        letpub_result: Optional[ImpactFactorLookupResult],
+        secondary_results: List[ImpactFactorLookupResult],
+        current_if: Optional[float],
+        should_correct_existing: bool,
+        tolerance: float,
+    ) -> bool:
+        """尝试使用官方 IF 结果（含交叉验证）。"""
+        if not official_result or official_result.status != "OK" or official_result.impact_factor is None:
+            return False
+
+        validators = [
+            result
+            for result in [letpub_result, *secondary_results]
+            if result is not None
+            and result.status == "OK"
+            and result.impact_factor is not None
+            and abs(result.impact_factor - official_result.impact_factor) <= tolerance
+        ]
+        selected = self._merge_impact_factor_results(
+            primary=official_result,
+            validators=validators,
+            status="OK_VALIDATED" if validators else "OK",
+        )
+        if self._apply_impact_factor_result(
+            paper_info, selected, current_if=current_if,
+            should_correct_existing=should_correct_existing,
+        ):
+            self.logger.info(
+                f"[IFLookup] selected IF={selected.impact_factor}, source={selected.source_name}"
+            )
+            return True
+        return False
 
     def _select_validated_impact_factor_result(
         self,
@@ -697,8 +740,8 @@ class AnalysisPipeline:
         valid_secondaries = [
             result
             for result in secondary_results
-            if getattr(result, "status", None) in {"OK", "OK_STALE"}
-            and getattr(result, "impact_factor", None) is not None
+            if result.status in {"OK", "OK_STALE"}
+            and result.impact_factor is not None
         ]
 
         if letpub_result and letpub_result.status == "OK" and letpub_result.impact_factor is not None:
@@ -808,8 +851,8 @@ class AnalysisPipeline:
         valid_results = [
             result
             for result in results
-            if getattr(result, "status", None) in {"OK", "OK_STALE"}
-            and getattr(result, "impact_factor", None) is not None
+            if result.status in {"OK", "OK_STALE"}
+            and result.impact_factor is not None
         ]
         if not valid_results:
             return None
@@ -849,13 +892,13 @@ class AnalysisPipeline:
         current_if: Optional[float],
         should_correct_existing: bool,
     ) -> bool:
-        source_url = getattr(fetch_result, "source_url", None)
+        source_url = fetch_result.source_url
         if source_url:
             paper_info.journal_profile_url = source_url
 
-        result_status = getattr(fetch_result, "status", None) or ""
-        new_source_name = getattr(fetch_result, "source_name", None)
-        impact_factor = getattr(fetch_result, "impact_factor", None)
+        result_status = fetch_result.status or ""
+        new_source_name = fetch_result.source_name
+        impact_factor = fetch_result.impact_factor
         if not str(result_status).startswith("OK") or impact_factor is None:
             return False
 
@@ -879,7 +922,7 @@ class AnalysisPipeline:
         if not (paper_info.impact_factor_status and str(paper_info.impact_factor_status).startswith("OK_VALIDATED")):
             paper_info.impact_factor_status = result_status
 
-        paper_info.impact_factor_year = getattr(fetch_result, "year", None)
+        paper_info.impact_factor_year = fetch_result.year
 
         if current_if is None or current_if <= 0:
             paper_info.impact_factor = impact_factor
@@ -899,30 +942,22 @@ class AnalysisPipeline:
 
     @staticmethod
     def _apply_impact_factor_status(paper_info, fetch_result: Any) -> None:
-        source_url = getattr(fetch_result, "source_url", None)
+        source_url = fetch_result.source_url
         if source_url:
             paper_info.journal_profile_url = source_url
 
-        source_name = getattr(fetch_result, "source_name", None)
+        source_name = fetch_result.source_name
         if source_name:
             paper_info.impact_factor_source = source_name
 
-        status = getattr(fetch_result, "status", None)
+        status = fetch_result.status
         if status:
             paper_info.impact_factor_status = status
 
-        paper_info.impact_factor_year = getattr(fetch_result, "year", None)
+        paper_info.impact_factor_year = fetch_result.year
 
         if status == "NO_ACCESS":
             paper_info.impact_factor = None
-
-    @staticmethod
-    def _should_try_secondary_if_sources(fetch_result: Any) -> bool:
-        status = getattr(fetch_result, "status", None)
-        impact_factor = getattr(fetch_result, "impact_factor", None)
-        if status == "OK" and impact_factor is not None:
-            return False
-        return status in {"ERROR", "NO_MATCH", "NOT_FOUND", "NOT_VISIBLE", "NO_QUERY"}
 
     def process_batch(
         self,
@@ -964,7 +999,7 @@ class AnalysisPipeline:
                             progress_bar.update(1)
                             continue
                         except Exception:
-                            pass
+                            self.logger.info(f"[Cache] stale cache for {pdf_path.name}, re-processing")
                 pending_files.append((pdf_path, md5))
 
             use_mineru_batch = (
@@ -999,7 +1034,10 @@ class AnalysisPipeline:
                             ),
                         )
                     except Exception as e:
-                        self.logger.warning(f"[MinerU Batch] batch parse failed; retrying one by one: {e}")
+                        self.logger.error(
+                            f"[MinerU Batch] batch parse failed; retrying one by one: {e}",
+                            exc_info=True,
+                        )
                         parse_results = {}
 
                     for pdf_path, md5 in batch_items:
@@ -1067,6 +1105,9 @@ class AnalysisPipeline:
         """
         pdf_dir = Path(pdf_dir)
 
+        # 重置性能计时器
+        self._timing = {}
+
         # 收集 PDF 文件
         if pdf_files is None:
             if recursive:
@@ -1112,6 +1153,7 @@ class AnalysisPipeline:
             "report_files": report_files,
             "renamed_count": renamed_count,
             "timestamp": datetime.now().isoformat(),
+            "timing": dict(self._timing) if self._timing else {},
         }
 
         # 输出统计
@@ -1180,31 +1222,11 @@ class AnalysisPipeline:
             json_results.append(json_row)
 
         for error in errors:
-            error_row = {
-                "File": error.get("pdf_name", ""),
-                "URL": Path(error["pdf_path"]).resolve().as_uri() if error.get("pdf_path") else "",
-                "processing_status": self._build_error_summary(error),
-                "标题": "",
-                "期刊": "",
-                "影响因子": "",
-                "影响因子年份": "",
-                "影响因子来源": "",
-                "影响因子状态": "",
-                "作者": "",
-                "器件结构": "",
-                "EQE": "",
-                "CIE": "",
-                "寿命": "",
-                "最高EQE": "",
-                "优化层级": "",
-                "优化策略": "",
-                "优化详情": "",
-                "关键发现": "",
-                "EQE原文": "",
-                "CIE原文": "",
-                "寿命原文": "",
-                "结构原文": "",
-            }
+            error_row = ReportGenerator.empty_result_row(
+                file_name=error.get("pdf_name", ""),
+                file_url=Path(error["pdf_path"]).resolve().as_uri() if error.get("pdf_path") else "",
+                processing_status=self._build_error_summary(error),
+            )
             dict_results.append(error_row)
 
             json_results.append(
@@ -1237,6 +1259,13 @@ class AnalysisPipeline:
         self.logger.info(f"PDF count: {stats['pdf_count']}")
         self.logger.info(f"Success: {stats['success_count']}")
         self.logger.info(f"Failed: {stats['error_count']}")
+        timing = stats.get("timing", {})
+        if timing:
+            total = sum(timing.values())
+            self.logger.info(f"Timing total: {total:.1f}s")
+            for stage, elapsed in sorted(timing.items(), key=lambda x: -x[1]):
+                pct = (elapsed / total * 100) if total > 0 else 0
+                self.logger.info(f"  {stage}: {elapsed:.1f}s ({pct:.0f}%)")
         self.logger.info("=" * 70)
 
     @staticmethod
@@ -1343,5 +1372,5 @@ class AnalysisPipeline:
             try:
                 temp_file.unlink()
                 self.logger.info(f"Temporary file removed: {temp_file}")
-            except Exception as e:
-                self.logger.warning(f"Temporary file cleanup failed: {temp_file}, {e}")
+            except OSError as e:
+                self.logger.error(f"Temporary file cleanup failed: {temp_file}, {e}")
