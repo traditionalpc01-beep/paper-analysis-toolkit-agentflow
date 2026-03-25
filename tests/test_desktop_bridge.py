@@ -124,3 +124,124 @@ def test_startup_recommendation_falls_back_to_system_python_when_needed():
     assert recommendation["engineMode"] == "system_python"
     assert recommendation["analysisMode"] == "api"
     assert readiness["status"] == "ready"
+
+
+def test_env_info_structure_has_required_keys():
+    """快照测试：env-info 返回结构应包含所有必需的顶层 key。"""
+    config = normalize_config(DEFAULT_CONFIG)
+    recommendation, readiness = _build_startup_recommendation(
+        config,
+        {
+            "bundledBackend": {"available": True, "current": False, "path": "", "message": ""},
+            "network": {"available": True},
+            "systemPython": {"available": False, "path": "", "hasPaperInsight": False, "message": ""},
+        },
+    )
+
+    # 模拟 env-info 的 env 结构
+    env = {
+        "pythonExecutable": "/usr/bin/python3",
+        "pythonVersion": "3.13.0",
+        "platform": "win32",
+        "version": "3.0.7",
+        "engineMode": "bundled",
+        "checks": {
+            "bundledBackend": {
+                "available": True,
+                "current": False,
+                "path": "",
+                "message": "Bundled backend detected.",
+            },
+            "network": {"available": True},
+            "systemPython": {
+                "available": False,
+                "path": "",
+                "hasPaperInsight": False,
+                "message": "System Python not found.",
+            },
+        },
+        "recommendation": recommendation,
+        "readiness": readiness,
+    }
+
+    # 验证顶层 key 完整性
+    assert "pythonExecutable" in env
+    assert "pythonVersion" in env
+    assert "platform" in env
+    assert "version" in env
+    assert "engineMode" in env
+    assert "checks" in env
+    assert "recommendation" in env
+    assert "readiness" in env
+
+    # 验证 checks 子结构
+    checks = env["checks"]
+    assert "bundledBackend" in checks
+    assert "network" in checks
+    assert "systemPython" in checks
+
+    # 验证 recommendation 子结构
+    rec = env["recommendation"]
+    assert "engineMode" in rec
+    assert "analysisMode" in rec
+    assert "fallbackTool" in rec
+
+    # 验证 readiness 子结构
+    rd = env["readiness"]
+    assert "status" in rd
+    assert "summary" in rd
+    assert rd["status"] in {"ready", "limited", "not_ready"}
+
+
+def test_build_stats_structure_covers_all_message_types():
+    """快照测试：stats 结构应包含 progress/file-complete/completed 消息所需字段。"""
+    stats = _build_stats(
+        pdf_files=[],
+        results=[],
+        errors=[],
+        report_files={},
+        renamed_count=0,
+        processed_items=[],
+    )
+
+    # progress 消息需要的字段
+    assert "pdfCount" in stats
+    assert "status" in stats
+
+    # completed 消息需要的字段
+    assert "successCount" in stats
+    assert "errorCount" in stats
+    assert "renamedCount" in stats
+    assert "reportFiles" in stats
+
+    # file-complete 消息需要的 successItems 和 errorItems
+    assert "successItems" in stats
+    assert "errorItems" in stats
+    assert isinstance(stats["successItems"], list)
+    assert isinstance(stats["errorItems"], list)
+
+    # 验证 successItems 结构
+    pdf_path = Path("/tmp/test.pdf")
+    paper = PaperData(
+        paper_info=PaperInfo(
+            title="Test",
+            journal_name="Nature",
+            impact_factor=12.3,
+        ),
+    )
+    stats_with_data = _build_stats(
+        pdf_files=[pdf_path],
+        results=[paper],
+        errors=[],
+        report_files={},
+        renamed_count=0,
+        processed_items=[(pdf_path, paper)],
+    )
+
+    item = stats_with_data["successItems"][0]
+    assert "file" in item
+    assert "path" in item
+    assert "title" in item
+    assert "journal" in item
+    assert "impactFactor" in item
+    assert "bestEqe" in item

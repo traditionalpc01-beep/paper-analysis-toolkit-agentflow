@@ -10,6 +10,9 @@ def test_report_columns_keep_expected_field_order():
         "url",
         "journal",
         "impact_factor",
+        "impact_factor_year",
+        "impact_factor_source",
+        "impact_factor_status",
         "authors",
         "processing_status",
         "title",
@@ -30,7 +33,7 @@ def test_report_columns_keep_expected_field_order():
 
 
 def test_report_columns_keep_expected_count():
-    assert len(ReportGenerator.REPORT_COLUMNS) == 20
+    assert len(ReportGenerator.REPORT_COLUMNS) == 23
 
 
 def test_reporter_default_filename_uses_chinese_prefix(tmp_path):
