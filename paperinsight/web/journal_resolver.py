@@ -14,6 +14,7 @@ from paperinsight.utils.journal_metadata import (
     normalize_exact_journal_title,
     normalize_issn,
 )
+from paperinsight.web.http_client import create_retryable_session
 from paperinsight.web.journal_if_database import JOURNAL_ALIASES
 
 
@@ -70,7 +71,7 @@ class MJLJournalResolver:
         session: Optional[requests.Session] = None,
     ) -> None:
         self.timeout = timeout
-        self.session = session or requests.Session()
+        self.session = session or create_retryable_session(timeout=timeout)
         self.session.headers.setdefault(
             "User-Agent",
             (

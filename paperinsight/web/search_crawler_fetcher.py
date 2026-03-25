@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 import requests
 
 from paperinsight.utils.journal_metadata import canonicalize_journal_title, normalize_issn
+from paperinsight.web.http_client import create_retryable_session
 from paperinsight.web.impact_factor_fetcher import ImpactFactorLookupResult
 
 
@@ -31,7 +32,7 @@ class SearchCrawlerFetcher:
     ) -> None:
         self.timeout = timeout
         self.market = market
-        self.session = session or requests.Session()
+        self.session = session or create_retryable_session(timeout=timeout)
         self.session.headers.setdefault(
             "User-Agent",
             (

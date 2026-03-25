@@ -6,6 +6,7 @@ from typing import Any, Optional
 import requests
 
 from paperinsight.utils.journal_metadata import canonicalize_journal_title, normalize_issn
+from paperinsight.web.http_client import create_retryable_session
 from paperinsight.web.impact_factor_fetcher import ImpactFactorLookupResult
 
 
@@ -38,7 +39,7 @@ class WOSJournalFetcher:
         self.api_key = api_key.strip()
         self.timeout = timeout
         self.base_url = (base_url or self.BASE_URL).rstrip("/")
-        self.session = session or requests.Session()
+        self.session = session or create_retryable_session(timeout=timeout)
         self.session.headers.setdefault("User-Agent", "PaperInsight/3.0")
         self.session.headers.setdefault("Accept", "application/json")
         self.session.headers["X-ApiKey"] = self.api_key

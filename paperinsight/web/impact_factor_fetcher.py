@@ -9,6 +9,7 @@ from urllib.parse import urlencode
 import requests
 
 from paperinsight.utils.journal_metadata import canonicalize_journal_title
+from paperinsight.web.http_client import create_retryable_session
 from paperinsight.web.journal_resolver import MJLJournalCandidate
 
 
@@ -41,7 +42,7 @@ class MJLImpactFactorFetcher:
         session: Optional[requests.Session] = None,
     ) -> None:
         self.timeout = timeout
-        self.session = session or requests.Session()
+        self.session = session or create_retryable_session(timeout=timeout)
         self.session.headers.setdefault(
             "User-Agent",
             (

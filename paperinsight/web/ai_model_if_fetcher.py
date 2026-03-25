@@ -21,6 +21,7 @@ from urllib.parse import quote
 import requests
 from bs4 import BeautifulSoup
 
+from paperinsight.web.http_client import create_retryable_session
 from paperinsight.web.impact_factor_fetcher import ImpactFactorLookupResult
 from paperinsight.web.journal_if_database import (
     JOURNAL_IF_DATABASE,
@@ -37,7 +38,7 @@ class LetPubFetcher:
     
     def __init__(self, timeout: int = 30):
         self.timeout = timeout
-        self.session = requests.Session()
+        self.session = create_retryable_session(timeout=timeout)
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -173,7 +174,7 @@ class CrossrefFetcher:
     
     def __init__(self, timeout: int = 30):
         self.timeout = timeout
-        self.session = requests.Session()
+        self.session = create_retryable_session(timeout=timeout)
         self.session.headers.update({
             'User-Agent': 'PaperInsight/1.0 (mailto:research@example.com)',
         })
@@ -213,7 +214,7 @@ class XMOLFetcher:
     
     def __init__(self, timeout: int = 30):
         self.timeout = timeout
-        self.session = requests.Session()
+        self.session = create_retryable_session(timeout=timeout)
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
