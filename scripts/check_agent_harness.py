@@ -26,6 +26,9 @@ EXPECTED_REPORT_FIELDS = [
     "url",
     "journal",
     "impact_factor",
+    "impact_factor_year",
+    "impact_factor_source",
+    "impact_factor_status",
     "authors",
     "processing_status",
     "title",
@@ -94,8 +97,8 @@ def check_report_contracts() -> dict[str, str]:
     report_fields = [field for _, field in ReportGenerator.REPORT_COLUMNS]
     if report_fields != EXPECTED_REPORT_FIELDS:
         return _fail("report columns", f"unexpected report fields: {report_fields}")
-    if len(report_fields) != 20:
-        return _fail("report columns", f"expected 20 columns, got {len(report_fields)}")
+    if len(report_fields) != 23:
+        return _fail("report columns", f"expected 23 columns, got {len(report_fields)}")
     return _ok("report columns", "field order and count are stable")
 
 

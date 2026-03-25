@@ -5,6 +5,7 @@
 
 import json
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union
@@ -85,6 +86,20 @@ class ReportGenerator:
         "lifetime_source": ("寿命原文", "lifetime_source"),
         "structure_source": ("结构原文", "structure_source"),
     }
+
+    @classmethod
+    def empty_result_row(cls, *, file_name: str = "", file_url: str = "", processing_status: str = "") -> dict:
+        """构造一个与 REPORT_COLUMNS 列定义一致的空行字典。
+
+        当 PDF 处理失败时，使用此方法生成错误行，确保列名始终与报表定义同步。
+        """
+        row: dict = {}
+        for _, field_key in cls.REPORT_COLUMNS:
+            row[field_key] = ""
+        row["file"] = file_name
+        row["url"] = file_url
+        row["processing_status"] = processing_status
+        return row
     
     def __init__(self, output_dir: Union[str, Path]):
         """
@@ -390,7 +405,7 @@ class ReportGenerator:
             return float(value)
 
         if isinstance(value, str):
-            match = __import__("re").search(r"([0-9]+(?:\.[0-9]+)?)", value)
+            match = re.search(r"([0-9]+(?:\.[0-9]+)?)", value)
             if match:
                 return float(match.group(1))
 

@@ -338,42 +338,19 @@ def _collect_pdf_files(pdf_dir: Path, recursive: bool, exclude_dirs: list[Path] 
 
 
 def _build_runtime_config(config: dict[str, Any], request: dict[str, Any]) -> tuple[dict[str, Any], str]:
-    runtime_config = copy.deepcopy(config)
-    requested_mode = str(request.get("mode") or "auto").lower()
-    selected_mode = requested_mode
-    if selected_mode == "auto":
-        selected_mode = "api" if _has_online_capability(runtime_config) else "regex"
+    from paperinsight.runtime_config import build_runtime_config
 
-    if selected_mode == "regex":
-        runtime_config.setdefault("llm", {})["enabled"] = False
-        runtime_config.setdefault("paddlex", {})["enabled"] = False
-
-    output_config = runtime_config.setdefault("output", {})
-    formats = list(output_config.get("format", ["excel"]))
-    if "excel" not in formats:
-        formats.insert(0, "excel")
-    if request.get("exportJson") and "json" not in formats:
-        formats.append("json")
-    if not request.get("exportJson"):
-        formats = [item for item in formats if item != "json"] or ["excel"]
-    output_config["format"] = formats
-
-    if "renamePdfs" in request:
-        output_config["rename_pdfs"] = bool(request.get("renamePdfs"))
-    if "bilingual" in request and request.get("bilingual") is not None:
-        output_config["bilingual_text"] = bool(request.get("bilingual"))
-
-    cache_config = runtime_config.setdefault("cache", {})
-    cache_config["enabled"] = bool(cache_config.get("enabled", True)) and not bool(request.get("noCache"))
-
-    desktop_config = runtime_config.setdefault("desktop", {})
-    ui_config = desktop_config.setdefault("ui", {})
-    if request.get("pdfDir"):
-        ui_config["last_pdf_dir"] = str(request["pdfDir"])
-    if request.get("outputDir"):
-        ui_config["last_output_dir"] = str(request["outputDir"])
-
-    return runtime_config, selected_mode
+    return build_runtime_config(
+        config,
+        mode=request.get("mode", "auto"),
+        export_json=bool(request.get("exportJson")),
+        no_json=not bool(request.get("exportJson")),
+        no_cache=bool(request.get("noCache")),
+        rename_pdfs=request.get("renamePdfs") if "renamePdfs" in request else None,
+        bilingual=request.get("bilingual") if "bilingual" in request else None,
+        pdf_dir=request.get("pdfDir"),
+        output_dir=request.get("outputDir"),
+    )
 
 
 def _build_stats(

@@ -1,0 +1,55 @@
+# Journal Aliases Configuration
+#
+# Used by DataExtractor to normalize journal names extracted from PDFs.
+# Each entry maps a common variant/abbreviation to the canonical journal name.
+#
+# You can append custom aliases to this file or override via user config.
+
+journal_domain_hints:
+  # Maps publisher domain names found in PDF headers/URLs to canonical journal names
+  "www.afm-journal.de": "Advanced Functional Materials"
+  "afm-journal.de": "Advanced Functional Materials"
+  "www.advmat.de": "Advanced Materials"
+  "advmat.de": "Advanced Materials"
+  "www.advopticalmat.de": "Advanced Optical Materials"
+  "advopticalmat.de": "Advanced Optical Materials"
+  "www.small-journal.com": "Small"
+  "small-journal.com": "Small"
+  "www.lpr-journal.org": "Laser & Photonics Reviews"
+  "lpr-journal.org": "Laser & Photonics Reviews"
+
+journal_title_aliases:
+  # Maps common abbreviations/variants to canonical journal names (case-insensitive lookup)
+  "adv funct materials": "Advanced Functional Materials"
+  "adv funct mater": "Advanced Functional Materials"
+  "adv. funct. mater.": "Advanced Functional Materials"
+  "adv. funct. materials": "Advanced Functional Materials"
+  "advanced materials": "Advanced Materials"
+  "adv materials": "Advanced Materials"
+  "adv. mater.": "Advanced Materials"
+  "advanced optical materials": "Advanced Optical Materials"
+  "adv. opt. mater.": "Advanced Optical Materials"
+  "adv opt mater": "Advanced Optical Materials"
+  "laser & photonics reviews": "Laser & Photonics Reviews"
+  "laser photonics reviews": "Laser & Photonics Reviews"
+  "laser photonics review": "Laser & Photonics Reviews"
+  "laser photon. rev.": "Laser & Photonics Reviews"
+  "small": "Small"
+  "nano lett.": "Nano Letters"
+  "nano lett": "Nano Letters"
+  "chem. mater.": "Chemistry of Materials"
+  "chem. mater": "Chemistry of Materials"
+  "j. am. chem. soc.": "Journal of the American Chemical Society"
+  "j am chem soc": "Journal of the American Chemical Society"
+  "nat. commun.": "Nature Communications"
+  "nature communications": "Nature Communications"
+  "nano res.": "Nano Research"
+  "nano research": "Nano Research"
+  "chemical engineering journal": "Chemical Engineering Journal"
+  "chem eng j": "Chemical Engineering Journal"
+  "chem eng j ": "Chemical Engineering Journal"
+  "chem. eng. j.": "Chemical Engineering Journal"
+  "journal of photochemistry photobiology c photochemistry reviews": "Journal of Photochemistry & Photobiology, C: Photochemistry Reviews"
+  "journal of photochemistry and photobiology c photochemistry reviews": "Journal of Photochemistry & Photobiology, C: Photochemistry Reviews"
+  "j photochem photobiol c photochem rev": "Journal of Photochemistry & Photobiology, C: Photochemistry Reviews"
+  "j photochem photobiol c photochemistry reviews": "Journal of Photochemistry & Photobiology, C: Photochemistry Reviews"
