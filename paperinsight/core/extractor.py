@@ -1,11 +1,17 @@
 """
-数据提取器模块 v3.0
+数据提取器模块 v3.1
 
 功能：
 1. 使用 LLM 进行语义化数据提取
 2. 嵌套式 JSON Schema 输出
 3. Pydantic 数据校验
 4. 正则表达式兜底方案
+
+v3.1 重构：将正则提取逻辑拆分为独立纯函数模块（composition 模式），
+    DataExtractor 方法委托到子模块函数，保持公共 API 不变。
+    - journal_utils: 期刊名称提取、ISSN 提取、别名查找
+    - device_extractor: 器件数据提取、去重、排序
+    - metadata_extractor: 标题/作者提取、论文属性检测
 """
 
 from __future__ import annotations
@@ -13,7 +19,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional
 
 from pydantic import ValidationError
 
@@ -35,93 +41,83 @@ from paperinsight.llm.prompt_templates import (
     format_lite_paper_info_backfill_prompt,
 )
 from paperinsight.utils.logger import setup_logger
-from paperinsight.utils.pdf_utils import PDFProcessor
+
+# ── 子模块导入（composition） ───────────────────────────────────
+
+from paperinsight.core.journal_utils import (
+    JOURNAL_DOMAIN_HINTS,
+    JOURNAL_TITLE_ALIASES,
+    JOURNAL_LINE_PATTERNS,
+    load_journal_aliases,
+    extract_raw_journal_metadata,
+    extract_journal_name,
+    extract_journal_name_from_subject,
+    extract_journal_name_from_filename,
+    extract_issn_from_text,
+    extract_pdf_metadata_from_source,
+    normalize_journal_title_candidate,
+    coerce_metadata_value,
+    first_non_empty,
+)
+from paperinsight.core.device_extractor import (
+    extract_devices,
+    extract_candidate_devices,
+    extract_all_structures,
+    extract_all_eqe,
+    extract_all_cie,
+    extract_all_lifetime,
+    build_device_segments,
+    segment_signal_score,
+    extract_first_structure,
+    extract_first_eqe,
+    extract_first_cie,
+    extract_first_lifetime,
+    extract_device_label,
+    build_device_notes,
+    merge_inferred_devices,
+    sanitize_devices,
+    sanitize_device,
+    device_signal_score,
+    device_signature,
+    refresh_best_eqe,
+)
+from paperinsight.core.metadata_extractor import (
+    TITLE_STOP_PATTERNS,
+    extract_title,
+    extract_title_candidates_from_lines,
+    build_title_blocks,
+    normalize_title_candidate,
+    is_bad_title_candidate,
+    score_title_candidate,
+    extract_authors,
+    extract_impact_factor,
+    extract_year,
+    detect_research_type,
+    detect_emitter_type,
+    extract_optimization_level,
+    extract_optimization_strategy,
+    extract_metric_source,
+)
 
 
 class DataExtractor:
     """
-    v3.0 数据提取器
+    v3.1 数据提取器
 
     支持两种提取模式：
     - LLM 模式：语义化提取，输出嵌套 JSON
     - Regex 模式：正则表达式提取（兜底）
+
+    正则提取逻辑委托到子模块纯函数（journal_utils / device_extractor / metadata_extractor）。
     """
 
-    JOURNAL_DOMAIN_HINTS = {
-        "www.afm-journal.de": "Advanced Functional Materials",
-        "afm-journal.de": "Advanced Functional Materials",
-        "www.advmat.de": "Advanced Materials",
-        "advmat.de": "Advanced Materials",
-        "www.advopticalmat.de": "Advanced Optical Materials",
-        "advopticalmat.de": "Advanced Optical Materials",
-        "www.small-journal.com": "Small",
-        "small-journal.com": "Small",
-        "www.lpr-journal.org": "Laser & Photonics Reviews",
-        "lpr-journal.org": "Laser & Photonics Reviews",
-    }
+    # 从 config/journal_aliases.yaml 加载（支持用户自定义扩展）
+    JOURNAL_DOMAIN_HINTS: dict[str, str] = JOURNAL_DOMAIN_HINTS
+    JOURNAL_TITLE_ALIASES: dict[str, str] = JOURNAL_TITLE_ALIASES
 
-    JOURNAL_TITLE_ALIASES = {
-        "adv funct materials": "Advanced Functional Materials",
-        "adv funct mater": "Advanced Functional Materials",
-        "adv. funct. mater.": "Advanced Functional Materials",
-        "adv. funct. materials": "Advanced Functional Materials",
-        "advanced materials": "Advanced Materials",
-        "adv materials": "Advanced Materials",
-        "adv. mater.": "Advanced Materials",
-        "advanced optical materials": "Advanced Optical Materials",
-        "adv. opt. mater.": "Advanced Optical Materials",
-        "adv opt mater": "Advanced Optical Materials",
-        "laser & photonics reviews": "Laser & Photonics Reviews",
-        "laser photonics reviews": "Laser & Photonics Reviews",
-        "laser photonics review": "Laser & Photonics Reviews",
-        "laser photon. rev.": "Laser & Photonics Reviews",
-        "small": "Small",
-        "nano lett.": "Nano Letters",
-        "nano lett": "Nano Letters",
-        "chem. mater.": "Chemistry of Materials",
-        "chem. mater": "Chemistry of Materials",
-        "j. am. chem. soc.": "Journal of the American Chemical Society",
-        "j am chem soc": "Journal of the American Chemical Society",
-        "nat. commun.": "Nature Communications",
-        "nature communications": "Nature Communications",
-        "nano res.": "Nano Research",
-        "nano research": "Nano Research",
-        "chemical engineering journal": "Chemical Engineering Journal",
-        "chem eng j": "Chemical Engineering Journal",
-        "chem eng j ": "Chemical Engineering Journal",
-        "chem. eng. j.": "Chemical Engineering Journal",
-        "journal of photochemistry photobiology c photochemistry reviews": "Journal of Photochemistry & Photobiology, C: Photochemistry Reviews",
-        "journal of photochemistry and photobiology c photochemistry reviews": "Journal of Photochemistry & Photobiology, C: Photochemistry Reviews",
-        "j photochem photobiol c photochem rev": "Journal of Photochemistry & Photobiology, C: Photochemistry Reviews",
-        "j photochem photobiol c photochemistry reviews": "Journal of Photochemistry & Photobiology, C: Photochemistry Reviews",
-    }
-
-    JOURNAL_LINE_PATTERNS = [
-        r"\bNature\s+(?:Communications|Photonics|Materials|Nanotechnology|Energy)\b",
-        r"\bAdvanced\s+(?:Materials|Functional\s+Materials|Optical\s+Materials|Energy\s+Materials)\b",
-        r"\bAdvanced Functional Materials\b",
-        r"\bAdvanced Materials\b",
-        r"\bAdvanced Optical Materials\b",
-        r"\bLaser\s*(?:&|and)?\s*Photonics\s+Reviews\b",
-        r"\bACS\s+(?:Nano|Applied\s+Materials|Energy\s+Letters|Photonics)\b",
-        r"\bNano\s+(?:Letters|Today|Research|Energy)\b",
-        r"\bJournal\s+of\s+the\s+American\s+Chemical\s+Society\b",
-        r"\bScience\s+Advances\b",
-        r"\bCell(?:\s+Reports)?\b",
-        r"\bAngewandte\s+Chemie\b",
-        r"\bChemical\s+Science\b",
-        r"\bPhysical\s+Review\s+(?:Letters|Applied)\b",
-    ]
-
-    TITLE_STOP_PATTERNS = [
-        r"^(?:abstract|a\s*b\s*s\s*t\s*r\s*a\s*c\s*t)\b",
-        r"^(?:keywords?|key words?)\b",
-        r"^(?:article info|a\s*r\s*t\s*i\s*c\s*l\s*e\s*i\s*n\s*f\s*o)\b",
-        r"^(?:introduction|results(?: and discussion)?|experimental(?: section)?|materials?(?: and methods?)?)\b",
-        r"^(?:received|accepted|published|available online|copyright)\b",
-        r"^(?:doi|https?://|www\.)\b",
-        r"^(?:corresponding author|e-?mail)\b",
-    ]
+    # 正则模式常量（保持向后兼容，实际使用子模块中的同名常量）
+    JOURNAL_LINE_PATTERNS = JOURNAL_LINE_PATTERNS
+    TITLE_STOP_PATTERNS = TITLE_STOP_PATTERNS
 
     def __init__(
         self,
@@ -150,6 +146,8 @@ class DataExtractor:
         self.llm: Optional[BaseLLM] = None
         self.lite_backfill_llm: Optional[BaseLLM] = None
         self._init_llm_client()
+
+    # ── LLM 客户端初始化 ─────────────────────────────────────────
 
     def _init_llm_client(self) -> None:
         """初始化 LLM 客户端"""
@@ -208,6 +206,8 @@ class DataExtractor:
             self.logger.warning(f"[LLM] lite backfill model init failed: {e}")
             return None
 
+    # ── 主提取入口 ───────────────────────────────────────────────
+
     def extract(
         self,
         markdown_text: str,
@@ -246,6 +246,8 @@ class DataExtractor:
         result.extraction_method = "regex"
 
         return result
+
+    # ── LLM 提取 ─────────────────────────────────────────────────
 
     def _extract_with_llm(
         self,
@@ -431,7 +433,7 @@ class DataExtractor:
                 data_source=data_source,
                 optimization=optimization,
             )
-            paper_data = self._sanitize_devices(paper_data)
+            paper_data = sanitize_devices(paper_data)
 
             return paper_data
 
@@ -441,6 +443,8 @@ class DataExtractor:
         except Exception as e:
             self.logger.warning(f"[ParseFailed] {e}")
             return None
+
+    # ── 正则提取（兜底） ─────────────────────────────────────────
 
     def _extract_with_regex(
         self,
@@ -504,6 +508,8 @@ class DataExtractor:
                 error_message=f"Regex extraction failed: {str(e)}",
             )
 
+    # ── 元数据回填 ───────────────────────────────────────────────
+
     def _backfill_paper_info_from_text(
         self,
         paper_data: PaperData,
@@ -514,9 +520,9 @@ class DataExtractor:
         raw_journal_title, raw_issn, raw_eissn = self._extract_raw_journal_metadata(text, parse_result)
         extracted_title = self._extract_title(text, parse_result)
 
-        normalized_existing_title = self._normalize_title_candidate(paper_info.title)
+        normalized_existing_title = normalize_title_candidate(paper_info.title)
         if extracted_title and (
-            not normalized_existing_title or self._is_bad_title_candidate(normalized_existing_title)
+            not normalized_existing_title or is_bad_title_candidate(normalized_existing_title)
         ):
             paper_info.title = extracted_title
         elif normalized_existing_title and normalized_existing_title != paper_info.title:
@@ -535,6 +541,8 @@ class DataExtractor:
             if extracted_if:
                 paper_info.impact_factor = extracted_if
         return paper_data
+
+    # ── Lite backfill（LLM 补填） ────────────────────────────────
 
     def lite_backfill_paper_info(
         self,
@@ -592,13 +600,13 @@ class DataExtractor:
 
     def _merge_lite_backfill_result(self, paper_data: PaperData, response: Dict[str, Any]) -> None:
         paper_info = paper_data.paper_info
-        title = self._coerce_metadata_value(response.get("title"))
-        authors = self._coerce_metadata_value(response.get("authors"))
-        journal_name = self._normalize_journal_title_candidate(
-            self._coerce_metadata_value(response.get("journal_name"))
+        title = coerce_metadata_value(response.get("title"))
+        authors = coerce_metadata_value(response.get("authors"))
+        journal_name = normalize_journal_title_candidate(
+            coerce_metadata_value(response.get("journal_name"))
         )
-        raw_journal_title = self._normalize_journal_title_candidate(
-            self._coerce_metadata_value(response.get("raw_journal_title"))
+        raw_journal_title = normalize_journal_title_candidate(
+            coerce_metadata_value(response.get("raw_journal_title"))
         )
         year_value = response.get("year")
 
@@ -626,892 +634,134 @@ class DataExtractor:
             f"year={paper_info.year!r}"
         )
 
-    # ============== 正则提取方法 ==============
+    # ============== 委托方法（正则提取） ==============
+    # 以下方法保持原始签名，实现委托到子模块纯函数。
+    # 这确保了测试代码和外部调用者无需修改。
+
+    # ── 标题 / 作者 ──────────────────────────────────────────────
 
     def _extract_title(self, text: str, parse_result: Optional[ParseResult]) -> Optional[str]:
-        """提取论文标题"""
-        metadata_candidates: List[str] = []
-        if parse_result:
-            metadata_candidates.extend(
-                filter(
-                    None,
-                    [
-                        self._coerce_metadata_value(parse_result.metadata.get("title")),
-                        self._coerce_metadata_value(parse_result.metadata.get("dc:title")),
-                    ],
-                )
-            )
-            source_metadata = self._extract_pdf_metadata_from_source(parse_result)
-            metadata_candidates.extend(
-                filter(
-                    None,
-                    [
-                        self._coerce_metadata_value(source_metadata.get("title")),
-                        self._coerce_metadata_value(source_metadata.get("subject")),
-                    ],
-                )
-            )
-
-        for candidate in metadata_candidates:
-            normalized = self._normalize_title_candidate(candidate)
-            if normalized and not self._is_bad_title_candidate(normalized):
-                return normalized
-
-        line_candidates = self._extract_title_candidates_from_lines(parse_result, text)
-        if line_candidates:
-            return line_candidates[0]
-
-        return None
-
-    def _extract_title_candidates_from_lines(
-        self,
-        parse_result: Optional[ParseResult],
-        text: str,
-    ) -> List[str]:
-        line_sources: List[str] = []
-        if parse_result and parse_result.markdown:
-            line_sources.append(parse_result.markdown)
-        if parse_result and parse_result.raw_text:
-            line_sources.append(parse_result.raw_text)
-        if text:
-            line_sources.append(text)
-
-        candidates: List[tuple[int, str]] = []
-        seen: set[str] = set()
-
-        for source in line_sources:
-            lines = source.splitlines()[:40]
-            filtered = [self._normalize_title_candidate(line) for line in lines]
-            filtered = [line for line in filtered if line]
-
-            for index, line in enumerate(filtered[:20]):
-                if self._is_bad_title_candidate(line):
-                    continue
-                score = self._score_title_candidate(line, index=index, heading_hint=lines[index].lstrip().startswith("#") if index < len(lines) else False)
-                if score <= 0 or line in seen:
-                    continue
-                seen.add(line)
-                candidates.append((score, line))
-
-            for block in self._build_title_blocks(filtered[:8]):
-                if block in seen or self._is_bad_title_candidate(block):
-                    continue
-                score = self._score_title_candidate(block, index=0, heading_hint=True) + 2
-                if score > 0:
-                    seen.add(block)
-                    candidates.append((score, block))
-
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        return [candidate for _, candidate in candidates]
-
-    def _build_title_blocks(self, lines: List[str]) -> List[str]:
-        blocks: List[str] = []
-        current: List[str] = []
-
-        for line in lines:
-            if self._is_bad_title_candidate(line):
-                if current:
-                    break
-                continue
-            if len(current) >= 3:
-                break
-            current.append(line)
-            joined = " ".join(current).strip()
-            if 20 <= len(joined) <= 260:
-                blocks.append(joined)
-        return blocks
-
-    def _normalize_title_candidate(self, value: Optional[str]) -> Optional[str]:
-        if value in (None, ""):
-            return None
-
-        candidate = str(value).strip()
-        candidate = re.sub(r"^[#*\-\s]+", "", candidate)
-        candidate = re.sub(r"\s+", " ", candidate).strip(" \"'`|")
-        candidate = re.sub(r"^(?:title|article title)\s*[:\-]\s*", "", candidate, flags=re.IGNORECASE)
-        candidate = re.sub(r"\s*\[[^\]]+\]\s*$", "", candidate).strip()
-        candidate = re.sub(r"\s*\(\s*(?:article|review|communication)\s*\)\s*$", "", candidate, flags=re.IGNORECASE).strip()
-        candidate = re.sub(r"\s*doi\s*:\s*10\.\S+$", "", candidate, flags=re.IGNORECASE).strip(" ,.;")
-        candidate = re.sub(r"\s*[•·]\s*$", "", candidate).strip()
-        return candidate or None
-
-    def _is_bad_title_candidate(self, candidate: str) -> bool:
-        lowered = candidate.lower().strip()
-        if not lowered:
-            return True
-        if len(candidate) < 20 or len(candidate) > 260:
-            return True
-        if any(re.match(pattern, lowered, re.IGNORECASE) for pattern in self.TITLE_STOP_PATTERNS):
-            return True
-        if "@" in candidate or "http" in lowered or "www." in lowered:
-            return True
-        if lowered.endswith(".pdf"):
-            return True
-        if re.fullmatch(r"[a-z]\s*(?:[a-z]\s*){4,}", lowered):
-            return True
-        if re.search(r"\b(?:university|college|institute|school|laboratory|department)\b", lowered):
-            return True
-        if re.fullmatch(
-            r"(?:[A-Z][a-zA-Z'`-]+(?:\s+[A-Z][a-zA-Z'`-]+){0,2}\s*[,*]?\s*){3,}",
-            candidate,
-        ):
-            return True
-        if candidate.count(",") >= 3 and not re.search(r"[:;]", candidate):
-            return True
-        if re.search(r"\b(?:figure|table)\s+\d+\b", lowered):
-            return True
-        if re.search(r"\b(?:orcid|supporting information)\b", lowered):
-            return True
-        if re.search(r"\b(?:j\.\s*[a-z]|adv\.|nano lett\.|chem\.)\b", lowered) and len(candidate.split()) <= 6:
-            return True
-        if sum(ch.isdigit() for ch in candidate) > max(4, len(candidate) // 8):
-            return True
-        return False
-
-    def _score_title_candidate(self, candidate: str, *, index: int, heading_hint: bool) -> int:
-        score = 0
-        word_count = len(candidate.split())
-        alpha_count = sum(ch.isalpha() for ch in candidate)
-        upper_ratio = sum(ch.isupper() for ch in candidate if ch.isalpha()) / max(alpha_count, 1)
-
-        if heading_hint:
-            score += 5
-        if index == 0:
-            score += 4
-        elif index <= 2:
-            score += 2
-
-        if 6 <= word_count <= 28:
-            score += 4
-        if 40 <= len(candidate) <= 180:
-            score += 4
-        if alpha_count >= max(20, len(candidate) * 0.45):
-            score += 3
-        if upper_ratio < 0.45:
-            score += 2
-        if ":" in candidate:
-            score += 1
-        if candidate.endswith("."):
-            score -= 2
-
-        return score
+        return extract_title(text, parse_result)
 
     def _extract_authors(self, text: str, parse_result: Optional[ParseResult]) -> Optional[str]:
-        """提取作者"""
-        if parse_result and parse_result.metadata.get("author"):
-            authors = parse_result.metadata["author"]
-            parts = [p.strip() for p in re.split(r"[;,\n]+", authors) if p.strip()]
-            return ", ".join(parts[:10])  # 限制作者数量
+        return extract_authors(text, parse_result)
 
-        # 正则匹配
-        name_pattern = r'\b[A-Z][a-z]+\s+[A-Z][a-z]+\b'
-        matches = re.findall(name_pattern, text[:5000])
-
-        if matches:
-            unique_names = list(dict.fromkeys(matches))[:10]
-            return ", ".join(unique_names)
-
-        return None
+    # ── 期刊元数据 ────────────────────────────────────────────────
 
     def _extract_raw_journal_metadata(
         self,
         text: str,
         parse_result: Optional[ParseResult],
     ) -> tuple[Optional[str], Optional[str], Optional[str]]:
-        """提取期刊原始标题、ISSN 和 eISSN。"""
-        metadata = dict(parse_result.metadata) if parse_result else {}
-        source_metadata = self._extract_pdf_metadata_from_source(parse_result)
-        for key, value in source_metadata.items():
-            metadata.setdefault(key, value)
-
-        raw_journal_title = self._first_non_empty(
-            self._normalize_journal_title_candidate(self._coerce_metadata_value(metadata.get("journal_name"))),
-            self._normalize_journal_title_candidate(self._coerce_metadata_value(metadata.get("journal"))),
-            self._normalize_journal_title_candidate(self._coerce_metadata_value(metadata.get("publication_name"))),
-            self._normalize_journal_title_candidate(self._coerce_metadata_value(metadata.get("publication_title"))),
-            self._normalize_journal_title_candidate(self._coerce_metadata_value(metadata.get("container_title"))),
-            self._extract_journal_name_from_subject(metadata),
-            self._extract_journal_name_from_filename(parse_result),
-            self._extract_journal_name(text),
-        )
-
-        raw_issn = self._first_non_empty(
-            self._coerce_metadata_value(metadata.get("issn")),
-            self._coerce_metadata_value(metadata.get("print_issn")),
-            self._coerce_metadata_value(metadata.get("pissn")),
-            self._coerce_metadata_value(metadata.get("issn_print")),
-        )
-        raw_eissn = self._first_non_empty(
-            self._coerce_metadata_value(metadata.get("eissn")),
-            self._coerce_metadata_value(metadata.get("electronic_issn")),
-            self._coerce_metadata_value(metadata.get("online_issn")),
-            self._coerce_metadata_value(metadata.get("issn_electronic")),
-        )
-
-        text_issn, text_eissn = self._extract_issn_from_text(text)
-        return raw_journal_title, raw_issn or text_issn, raw_eissn or text_eissn
-
-    def _extract_pdf_metadata_from_source(self, parse_result: Optional[ParseResult]) -> Dict[str, Any]:
-        if not parse_result or not parse_result.source_file:
-            return {}
-
-        try:
-            with PDFProcessor(parse_result.source_file) as processor:
-                return processor._extract_metadata(processor._open())
-        except Exception:
-            return {}
-
-    def _extract_issn_from_text(self, text: str) -> tuple[Optional[str], Optional[str]]:
-        """从文章前部文本提取 ISSN/eISSN。"""
-        head_text = text[:5000]
-        issn_pattern = r"(\d{4}-?\d{3}[\dXx])"
-
-        eissn_match = re.search(
-            rf"\b(?:e-?issn|electronic\s+issn|online\s+issn)\b[^0-9A-Za-z]{{0,10}}{issn_pattern}",
-            head_text,
-            re.IGNORECASE,
-        )
-        issn_match = re.search(
-            rf"\b(?:p-?issn|print\s+issn|issn\s*\(print\)|issn)\b[^0-9A-Za-z]{{0,10}}{issn_pattern}",
-            head_text,
-            re.IGNORECASE,
-        )
-
-        generic_matches = re.findall(r"\b\d{4}-?\d{3}[\dXx]\b", head_text)
-        raw_issn = issn_match.group(1) if issn_match else None
-        raw_eissn = eissn_match.group(1) if eissn_match else None
-
-        if not raw_issn and generic_matches:
-            raw_issn = generic_matches[0]
-        if not raw_eissn and len(generic_matches) > 1:
-            for candidate in generic_matches:
-                if candidate != raw_issn:
-                    raw_eissn = candidate
-                    break
-
-        return raw_issn, raw_eissn
-
-    @staticmethod
-    def _coerce_metadata_value(value: Any) -> Optional[str]:
-        if value in (None, ""):
-            return None
-        if isinstance(value, str):
-            return value.strip() or None
-        if isinstance(value, (list, tuple)):
-            for item in value:
-                coerced = DataExtractor._coerce_metadata_value(item)
-                if coerced:
-                    return coerced
-            return None
-        return str(value).strip() or None
-
-    @staticmethod
-    def _first_non_empty(*values: Optional[str]) -> Optional[str]:
-        for value in values:
-            if value not in (None, ""):
-                return value
-        return None
+        return extract_raw_journal_metadata(text, parse_result)
 
     def _extract_journal_name(self, text: str) -> Optional[str]:
-        """提取期刊名称"""
-        head_text = text[:5000]
-        head_lower = head_text.lower()
-
-        for domain, journal_name in self.JOURNAL_DOMAIN_HINTS.items():
-            if domain in head_lower:
-                return journal_name
-
-        candidate_lines = []
-        for line in head_text.splitlines():
-            cleaned = re.sub(r"\s+", " ", line).strip()
-            if cleaned:
-                candidate_lines.append(cleaned)
-
-        for line in candidate_lines[:40]:
-            normalized_line = self._normalize_journal_title_candidate(line)
-            if normalized_line:
-                return normalized_line
-
-            for pattern in self.JOURNAL_LINE_PATTERNS:
-                match = re.search(pattern, line, re.IGNORECASE)
-                if match:
-                    normalized_match = self._normalize_journal_title_candidate(match.group(0))
-                    if normalized_match:
-                        return normalized_match
-
-        return None
+        return extract_journal_name(text)
 
     def _extract_journal_name_from_subject(self, metadata: Dict[str, Any]) -> Optional[str]:
-        subject = self._coerce_metadata_value(metadata.get("subject"))
-        if not subject:
-            return None
-
-        normalized_subject = re.sub(r"\s+", " ", subject).strip()
-        normalized_subject = re.sub(r"\bdoi\s*:\s*10\.\S+$", "", normalized_subject, flags=re.IGNORECASE).strip(" ,.;")
-
-        subject_candidates = [normalized_subject]
-        volume_patterns = [
-            r"^(.+?)(?:,\s*\d+\s*\((?:19|20)\d{2}\).*)$",
-            r"^(.+?)(?:\s+\d+\s*\((?:19|20)\d{2}\).*)$",
-            r"^(.+?)(?:\s+(?:19|20)\d{2}[,.:; ].*)$",
-            r"^(.+?)(?:\s+(?:19|20)\d{2}\.\d+.*)$",
-        ]
-        for pattern in volume_patterns:
-            match = re.match(pattern, normalized_subject, re.IGNORECASE)
-            if match:
-                subject_candidates.insert(0, match.group(1).strip(" ,.;"))
-
-        for candidate_text in subject_candidates:
-            candidate = self._normalize_journal_title_candidate(candidate_text)
-            if candidate:
-                return candidate
-
-        return None
+        return extract_journal_name_from_subject(metadata)
 
     def _extract_journal_name_from_filename(
         self,
         parse_result: Optional[ParseResult],
     ) -> Optional[str]:
-        if not parse_result or not parse_result.source_file:
-            return None
-
-        filename = str(parse_result.source_file).split("/")[-1].split("\\")[-1]
-        filename = re.sub(r"\.pdf$", "", filename, flags=re.IGNORECASE)
-
-        candidates = [filename]
-        split_candidates = re.split(r"\s+-\s+", filename)
-        if split_candidates:
-            candidates.append(split_candidates[0])
-            if len(split_candidates) >= 2:
-                candidates.append(" - ".join(split_candidates[:2]))
-
-        for candidate in candidates:
-            normalized = self._normalize_journal_title_candidate(candidate)
-            if normalized:
-                return normalized
-
-        return None
+        return extract_journal_name_from_filename(parse_result)
 
     def _normalize_journal_title_candidate(self, value: Optional[str]) -> Optional[str]:
-        if value in (None, ""):
-            return None
+        return normalize_journal_title_candidate(value)
 
-        candidate = re.sub(r"\s+", " ", str(value)).strip()
-        candidate = re.sub(r"^(?:cite\s+this|available\s+online)\b[:\s-]*", "", candidate, flags=re.IGNORECASE)
-        candidate = re.sub(r"^(?:review|research article|article)\b[:\s-]*", "", candidate, flags=re.IGNORECASE)
-        candidate = re.sub(r"\bdoi\s*:\s*10\.\S+$", "", candidate, flags=re.IGNORECASE).strip(" -|,;.")
-        candidate = re.sub(r"\bwww\.[^\s]+", "", candidate, flags=re.IGNORECASE).strip(" -|,;")
-        candidate = re.sub(r"\(\d+\)$", "", candidate).strip()
-        candidate = re.sub(r"\b(19|20)\d{2}\b.*$", "", candidate).strip(" -|,;")
-        candidate = re.sub(r"^[0-9A-Za-z_.-]+-main(?:\s*\(\d+\))?$", "", candidate, flags=re.IGNORECASE).strip()
-        candidate = re.sub(r"\s*\([^)]*\)$", "", candidate).strip(" -|,;.")
+    def _extract_issn_from_text(self, text: str) -> tuple[Optional[str], Optional[str]]:
+        return extract_issn_from_text(text)
 
-        lower_candidate = candidate.lower()
-        if any(token in lower_candidate for token in ("university of science", "school of materials science")):
-            return None
+    def _extract_pdf_metadata_from_source(self, parse_result: Optional[ParseResult]) -> Dict[str, Any]:
+        return extract_pdf_metadata_from_source(parse_result)
 
-        alias = self.JOURNAL_TITLE_ALIASES.get(lower_candidate)
-        if alias:
-            return alias
+    @staticmethod
+    def _coerce_metadata_value(value: Any) -> Optional[str]:
+        return coerce_metadata_value(value)
 
-        simplified_candidate = re.sub(r"[^a-z0-9]+", " ", lower_candidate).strip()
-        alias = self.JOURNAL_TITLE_ALIASES.get(simplified_candidate)
-        if alias:
-            return alias
+    @staticmethod
+    def _first_non_empty(*values: Optional[str]) -> Optional[str]:
+        return first_non_empty(*values)
 
-        for pattern in self.JOURNAL_LINE_PATTERNS:
-            full_match = re.fullmatch(pattern, candidate, re.IGNORECASE)
-            if full_match:
-                return full_match.group(0)
-
-        return None
+    # ── 论文属性 ─────────────────────────────────────────────────
 
     def _extract_impact_factor(self, text: str) -> Optional[float]:
-        """提取影响因子"""
-        patterns = [
-            r'impact\s+factor[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)',
-            r'\bIF[^0-9]{0,10}([0-9]+(?:\.[0-9]+)?)\b',
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, text[:3000], re.IGNORECASE)
-            if match:
-                try:
-                    value = float(match.group(1))
-                    if 0.1 < value < 200:
-                        return value
-                except ValueError:
-                    continue
-
-        return None
+        return extract_impact_factor(text)
 
     def _extract_year(self, text: str) -> Optional[int]:
-        """提取发表年份"""
-        # 查找年份模式
-        patterns = [
-            r'(?:published|accepted|received)[^0-9]{0,20}(20[1-2][0-9])',
-            r'©?\s*(20[1-2][0-9])\s+(?:The\s+Author|Elsevier|Nature|Science|Wiley)',
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, text[:3000], re.IGNORECASE)
-            if match:
-                try:
-                    return int(match.group(1))
-                except ValueError:
-                    continue
-
-        return None
+        return extract_year(text)
 
     def _detect_research_type(self, text: str) -> Optional[str]:
-        """检测研究类型"""
-        types = {
-            "OLED": [r'\bOLED\b', r'organic\s+light.emitting\s+diode'],
-            "PLED": [r'\bPLED\b', r'polymer\s+light.emitting\s+diode'],
-            "QLED": [r'\bQLED\b', r'quantum\s+dot\s+LED'],
-            "PeLED": [r'\bPeLED\b', r'perovskite\s+LED'],
-            "LED": [r'\bLED\b', r'light.emitting\s+diode'],
-        }
-
-        text_lower = text.lower()
-        for rtype, patterns in types.items():
-            for pattern in patterns:
-                if re.search(pattern, text_lower):
-                    return rtype
-
-        return None
+        return detect_research_type(text)
 
     def _detect_emitter_type(self, text: str) -> Optional[str]:
-        """检测发光材料类型"""
-        types = {
-            "TADF": [r'\bTADF\b', r'thermally\s+activated\s+delayed\s+fluorescence'],
-            "Phosphorescent": [r'phosphorescen', r'\bIr\([^)]+\)', r'\bPt\([^)]+\)'],
-            "Fluorescent": [r'\bfluorescen(?!\s+delayed)', r'traditional\s+fluorescen'],
-            "Perovskite": [r'perovskite', r'\bCsPb[^,]*,', r'\bMAPb'],
-        }
-
-        text_lower = text.lower()
-        for etype, patterns in types.items():
-            for pattern in patterns:
-                if re.search(pattern, text_lower):
-                    return etype
-
-        return None
-
-    def _extract_devices(self, text: str) -> List[DeviceData]:
-        """提取器件数据"""
-        candidate_devices = self._extract_candidate_devices(text)
-        if candidate_devices:
-            return candidate_devices
-
-        structures = self._extract_all_structures(text)
-        eqes = self._extract_all_eqe(text)
-        cies = self._extract_all_cie(text)
-        lifetimes = self._extract_all_lifetime(text)
-
-        if structures or eqes or cies or lifetimes:
-            return [
-                DeviceData(
-                    structure=structures[0] if structures else None,
-                    eqe=eqes[0] if eqes else None,
-                    cie=cies[0] if cies else None,
-                    lifetime=lifetimes[0] if lifetimes else None,
-                )
-            ]
-
-        return []
-
-    def _extract_candidate_devices(self, text: str) -> List[DeviceData]:
-        """按段落/候选片段提取多器件信息。"""
-        segments = self._build_device_segments(text)
-        devices: List[DeviceData] = []
-        seen_signatures: set[tuple] = set()
-
-        for segment in segments:
-            structure = self._extract_first_structure(segment)
-            eqe = self._extract_first_eqe(segment)
-            cie = self._extract_first_cie(segment)
-            lifetime = self._extract_first_lifetime(segment)
-            label = self._extract_device_label(segment)
-
-            has_signal = bool(structure or eqe or cie or lifetime)
-            if not has_signal:
-                continue
-
-            signature = (label or "", structure or "", eqe or "", cie or "", lifetime or "")
-            if signature in seen_signatures:
-                continue
-            seen_signatures.add(signature)
-
-            devices.append(
-                DeviceData(
-                    device_label=label,
-                    structure=structure,
-                    eqe=eqe,
-                    cie=cie,
-                    lifetime=lifetime,
-                    notes=self._build_device_notes(segment),
-                )
-            )
-
-        return devices[:6]
-
-    def _build_device_segments(self, text: str) -> List[str]:
-        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-        segments: List[str] = []
-
-        for paragraph in paragraphs:
-            if self._segment_signal_score(paragraph) >= 2:
-                segments.append(paragraph)
-
-        sentence_chunks = re.split(r"(?<=[.!?])\s+", text)
-        window: List[str] = []
-        for sentence in sentence_chunks:
-            sentence = sentence.strip()
-            if not sentence:
-                continue
-            if self._segment_signal_score(sentence) > 0:
-                window.append(sentence)
-            else:
-                if window:
-                    segments.append(" ".join(window))
-                    window = []
-        if window:
-            segments.append(" ".join(window))
-
-        deduped: List[str] = []
-        seen: set[str] = set()
-        for segment in segments:
-            normalized = re.sub(r"\s+", " ", segment)
-            if normalized not in seen:
-                seen.add(normalized)
-                deduped.append(segment)
-        return deduped[:20]
-
-    def _segment_signal_score(self, text: str) -> int:
-        score = 0
-        if self._extract_first_structure(text):
-            score += 2
-        if self._extract_first_eqe(text):
-            score += 2
-        if self._extract_first_cie(text):
-            score += 1
-        if self._extract_first_lifetime(text):
-            score += 1
-        if self._extract_device_label(text):
-            score += 1
-        return score
-
-    def _extract_first_structure(self, text: str) -> Optional[str]:
-        structures = self._extract_all_structures(text)
-        return structures[0] if structures else None
-
-    def _extract_first_eqe(self, text: str) -> Optional[str]:
-        values = self._extract_all_eqe(text)
-        return values[0] if values else None
-
-    def _extract_first_cie(self, text: str) -> Optional[str]:
-        values = self._extract_all_cie(text)
-        return values[0] if values else None
-
-    def _extract_first_lifetime(self, text: str) -> Optional[str]:
-        values = self._extract_all_lifetime(text)
-        return values[0] if values else None
-
-    def _extract_device_label(self, text: str) -> Optional[str]:
-        patterns = [
-            r"\b(champion device|best device|optimized device|control device|reference device)\b",
-            r"\b(device\s*[A-Z0-9])\b",
-            r"\b(sample\s*[A-Z0-9])\b",
-            r"\b(QLED[-\s]*[A-Z0-9]+)\b",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                return " ".join(match.group(1).split())
-        return None
-
-    def _build_device_notes(self, text: str) -> Optional[str]:
-        compact = " ".join(text.split())
-        if len(compact) <= 220:
-            return compact
-        return compact[:217].rstrip() + "..."
-
-    def _merge_inferred_devices(self, paper_data: PaperData, text: str) -> PaperData:
-        """用本地启发式补强器件列表，优先修补空器件或单器件缺字段场景。"""
-        inferred_devices = self._extract_candidate_devices(text)
-        if not inferred_devices:
-            return paper_data
-
-        existing_devices = list(paper_data.devices)
-        if not existing_devices:
-            paper_data.devices = inferred_devices
-            self._refresh_best_eqe(paper_data)
-            return paper_data
-
-        if len(existing_devices) == 1 and self._device_signal_score(existing_devices[0]) <= 1:
-            paper_data.devices = inferred_devices
-            self._refresh_best_eqe(paper_data)
-            return paper_data
-
-        merged = list(existing_devices)
-        seen = {self._device_signature(device) for device in merged}
-        for device in inferred_devices:
-            signature = self._device_signature(device)
-            if signature in seen:
-                continue
-            seen.add(signature)
-            merged.append(device)
-
-        paper_data.devices = merged[:6]
-        self._refresh_best_eqe(paper_data)
-        return paper_data
-
-    def _device_signal_score(self, device: DeviceData) -> int:
-        return sum(
-            1
-            for value in [device.device_label, device.structure, device.eqe, device.cie, device.lifetime]
-            if value
-        )
-
-    def _device_signature(self, device: DeviceData) -> tuple:
-        return (
-            (device.device_label or "").lower(),
-            (device.structure or "").lower(),
-            (device.eqe or "").lower(),
-            (device.cie or "").lower(),
-            (device.lifetime or "").lower(),
-        )
-
-    def _refresh_best_eqe(self, paper_data: PaperData) -> None:
-        if paper_data.paper_info.best_eqe:
-            return
-
-        best_value = -1.0
-        best_label = None
-        for device in paper_data.devices:
-            if not device.eqe:
-                continue
-            match = re.search(r"([0-9]+(?:\.[0-9]+)?)", device.eqe)
-            if not match:
-                continue
-            value = float(match.group(1))
-            if value > best_value:
-                best_value = value
-                best_label = device.eqe
-
-        if best_label:
-            paper_data.paper_info.best_eqe = best_label
-
-    def _sanitize_devices(self, paper_data: PaperData) -> PaperData:
-        cleaned_devices: List[DeviceData] = []
-        seen: set[tuple] = set()
-
-        for device in paper_data.devices:
-            normalized = self._sanitize_device(device)
-            if normalized is None:
-                continue
-            signature = self._device_signature(normalized)
-            if signature in seen:
-                continue
-            seen.add(signature)
-            cleaned_devices.append(normalized)
-
-        cleaned_devices.sort(
-            key=lambda item: (
-                self._device_signal_score(item),
-                1 if item.eqe else 0,
-                1 if item.lifetime else 0,
-                1 if item.structure else 0,
-            ),
-            reverse=True,
-        )
-        paper_data.devices = cleaned_devices[:6]
-
-        if paper_data.paper_info.best_eqe and not any(
-            device.eqe == paper_data.paper_info.best_eqe for device in paper_data.devices
-        ):
-            paper_data.paper_info.best_eqe = None
-        self._refresh_best_eqe(paper_data)
-        return paper_data
-
-    def _sanitize_device(self, device: DeviceData) -> Optional[DeviceData]:
-        structure = device.structure
-        if structure:
-            structure = re.sub(r"\s+", " ", structure).strip(" .;")
-            if len(structure) > 220 or structure.count(".") > 1:
-                structure = self._extract_first_structure(structure)
-
-        notes = device.notes
-        if notes:
-            notes = re.sub(r"\s+", " ", notes).strip()
-            if len(notes) > 280:
-                notes = notes[:277].rstrip() + "..."
-
-        normalized = DeviceData(
-            device_label=device.device_label,
-            structure=structure,
-            eqe=device.eqe,
-            cie=device.cie,
-            lifetime=device.lifetime,
-            luminance=device.luminance,
-            current_efficiency=device.current_efficiency,
-            power_efficiency=device.power_efficiency,
-            notes=notes,
-        )
-
-        score = self._device_signal_score(normalized)
-        has_key_metric = bool(normalized.eqe or normalized.cie or normalized.lifetime)
-        if score == 0:
-            return None
-        if score <= 1 and not has_key_metric:
-            return None
-        return normalized
-
-    def _extract_all_structures(self, text: str) -> List[str]:
-        """提取所有器件结构"""
-        patterns = [
-            r'((?:ITO|Glass)\s*/\s*[A-Za-z0-9:+()._\-\s]{1,40}(?:\s*/\s*[A-Za-z0-9:+()._\-\s]{1,40}){2,8})',
-        ]
-
-        structures = []
-        for pattern in patterns:
-            matches = re.findall(pattern, text)
-            for m in matches:
-                cleaned = re.sub(r"\s+", " ", m).strip(" .;,)(")
-                if len(cleaned) > 10 and cleaned not in structures:
-                    structures.append(cleaned)
-
-        return structures[:3]  # 限制数量
-
-    def _extract_all_eqe(self, text: str) -> List[str]:
-        """提取所有 EQE 值"""
-        patterns = [
-            r'EQE[^0-9<≥>]*?([0-9]+\.?[0-9]*)\s*%',
-            r'external quantum efficiency[^0-9<≥>]*?([0-9]+\.?[0-9]*)\s*%',
-            r'max(?:imum)?\s+EQE[^0-9]*?([0-9]+\.?[0-9]*)\s*%',
-        ]
-
-        values = []
-        for pattern in patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            for m in matches:
-                try:
-                    v = float(m)
-                    if 0.1 < v < 80:  # EQE 合理范围
-                        formatted = f"{v:.2f}%"
-                        if formatted not in values:
-                            values.append(formatted)
-                except ValueError:
-                    pass
-
-        return values[:5]  # 限制数量
-
-    def _extract_all_cie(self, text: str) -> List[str]:
-        """提取所有 CIE 坐标"""
-        patterns = [
-            r'CIE[^0-9]*?\(([0-9]\.[0-9]+)\s*[,，]\s*([0-9]\.[0-9]+)\)',
-            r'\(([0-9]\.[0-9]+)\s*[,，]\s*([0-9]\.[0-9]+)\)[^)]*CIE',
-        ]
-
-        values = []
-        for pattern in patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            for m in matches:
-                try:
-                    x, y = float(m[0]), float(m[1])
-                    if 0 < x < 1 and 0 < y < 1:
-                        formatted = f"({x:.4f}, {y:.4f})"
-                        if formatted not in values:
-                            values.append(formatted)
-                except (ValueError, IndexError):
-                    pass
-
-        return values[:5]
-
-    def _extract_all_lifetime(self, text: str) -> List[str]:
-        """提取所有寿命值"""
-        patterns = [
-            r'T[⑤5]0[^0-9]*?([0-9]+\.?[0-9]*)\s*(h|hr|hrs|hour|hours)',
-            r'LT[⑤5]0[^0-9]*?([0-9]+\.?[0-9]*)\s*(h|hr|hrs|hour|hours)',
-            r'lifetime[^0-9]*?([0-9]+\.?[0-9]*)\s*(h|hour|hours)',
-        ]
-
-        values = []
-        for pattern in patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            for m in matches:
-                try:
-                    v = float(m[0])
-                    if 1 < v < 50000:
-                        formatted = f"{v:.1f} h"
-                        if formatted not in values:
-                            values.append(formatted)
-                except (ValueError, IndexError):
-                    pass
-
-        return values[:5]
+        return detect_emitter_type(text)
 
     def _extract_optimization_level(self, text: str) -> Optional[str]:
-        """提取优化层级"""
-        levels = []
-        level_keywords = {
-            "材料合成": ["synthesis", "material design", "precursor"],
-            "核壳结构": ["core-shell", "core/shell", "shell growth"],
-            "表面处理": ["surface treatment", "surface modification", "passivation"],
-            "配体工程": ["ligand engineering", "ligand exchange"],
-            "器件结构": ["device architecture", "device structure"],
-            "工艺优化": ["annealing", "thermal treatment"],
-        }
-
-        text_lower = text.lower()
-        for level, keywords in level_keywords.items():
-            if any(kw in text_lower for kw in keywords):
-                levels.append(level)
-
-        return "、".join(levels) if levels else None
+        return extract_optimization_level(text)
 
     def _extract_optimization_strategy(self, text: str) -> Optional[str]:
-        """提取优化策略"""
-        strategies = []
-        strategy_keywords = {
-            "表面钝化": ["passivation", "defect passivation"],
-            "配体交换": ["ligand exchange", "ligand replacement"],
-            "核壳工程": ["core-shell", "shell growth"],
-            "界面工程": ["interface engineering"],
-            "退火处理": ["annealing", "thermal treatment"],
-        }
-
-        text_lower = text.lower()
-        for strategy, keywords in strategy_keywords.items():
-            if any(kw in text_lower for kw in keywords):
-                strategies.append(strategy)
-
-        if strategies:
-            return f"采用{', '.join(strategies)}等方法优化器件性能。"
-
-        return None
+        return extract_optimization_strategy(text)
 
     def _extract_metric_source(self, text: str, metric: str) -> Optional[str]:
-        """提取指标原文"""
-        sentence_patterns = {
-            "eqe": [
-                r'[^.!?\n]*?(?:EQE|external quantum efficiency)[^.!?\n]*?[0-9]+(?:\.[0-9]+)?\s*%[^.!?\n]*[.!?]?',
-            ],
-            "cie": [
-                r'[^.!?\n]*?CIE[^.!?\n]*?\([0-9]\.[0-9]+\s*[,，]\s*[0-9]\.[0-9]+\)[^.!?\n]*[.!?]?',
-            ],
-            "lifetime": [
-                r'[^.!?\n]*?(?:T[⑤5]0|LT[⑤5]0|lifetime)[^.!?\n]*?[0-9]+(?:\.[0-9]+)?\s*(?:h|hr|hrs|hour|hours)[^.!?\n]*[.!?]?',
-            ],
-            "structure": [
-                r'[^.!?\n]*?(?:device\s+structure|architecture)[^.!?\n]*?ITO[^.!?\n]*[.!?]?',
-            ],
-        }
+        return extract_metric_source(text, metric)
 
-        for pattern in sentence_patterns.get(metric, []):
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                return " ".join(match.group(0).split())
+    # ── 器件提取 ─────────────────────────────────────────────────
 
-        return None
+    def _extract_devices(self, text: str) -> List[DeviceData]:
+        return extract_devices(text)
+
+    def _extract_candidate_devices(self, text: str) -> List[DeviceData]:
+        return extract_candidate_devices(text)
+
+    def _extract_all_structures(self, text: str) -> List[str]:
+        return extract_all_structures(text)
+
+    def _extract_all_eqe(self, text: str) -> List[str]:
+        return extract_all_eqe(text)
+
+    def _extract_all_cie(self, text: str) -> List[str]:
+        return extract_all_cie(text)
+
+    def _extract_all_lifetime(self, text: str) -> List[str]:
+        return extract_all_lifetime(text)
+
+    def _merge_inferred_devices(self, paper_data: PaperData, text: str) -> PaperData:
+        return merge_inferred_devices(paper_data, text)
+
+    def _sanitize_devices(self, paper_data: PaperData) -> PaperData:
+        return sanitize_devices(paper_data)
+
+    def _sanitize_device(self, device: DeviceData) -> Optional[DeviceData]:
+        return sanitize_device(device)
+
+    def _device_signal_score(self, device: DeviceData) -> int:
+        return device_signal_score(device)
+
+    def _device_signature(self, device: DeviceData) -> tuple:
+        return device_signature(device)
+
+    def _refresh_best_eqe(self, paper_data: PaperData) -> None:
+        refresh_best_eqe(paper_data)
+
+    # ── 标题辅助 ─────────────────────────────────────────────────
+
+    def _extract_title_candidates_from_lines(
+        self,
+        parse_result: Optional[ParseResult],
+        text: str,
+    ) -> List[str]:
+        return extract_title_candidates_from_lines(parse_result, text)
+
+    def _build_title_blocks(self, lines: List[str]) -> List[str]:
+        return build_title_blocks(lines)
+
+    def _normalize_title_candidate(self, value: Optional[str]) -> Optional[str]:
+        return normalize_title_candidate(value)
+
+    def _is_bad_title_candidate(self, candidate: str) -> bool:
+        return is_bad_title_candidate(candidate)
+
+    def _score_title_candidate(self, candidate: str, *, index: int, heading_hint: bool) -> int:
+        return score_title_candidate(candidate, index=index, heading_hint=heading_hint)
